@@ -80,6 +80,44 @@ def check_token(token):
     return hashlib.sha256(token.strip().encode("utf-8")).hexdigest() == TOKEN_HASH
 
 
+# --- Changelog ---------------------------------------------------------------
+# Bump CURRENT_VERSION and append one CHANGELOG entry every time a feature batch
+# ships -- this is what drives the one-time "What's New" screen after an update
+# and the manual Patch Notes view. Oldest entry first.
+CURRENT_VERSION = "1.4"
+CHANGELOG = [
+    ("1.0", "First release", [
+        "Bind a global trigger key and pick a disconnect duration (1-10s)",
+        "Black-and-purple UI: intro screen with Start, then trigger key + duration + Arm",
+        "Internet cut at the firewall layer so reconnect timing stays accurate",
+    ]),
+    ("1.1", "Polish pass", [
+        "Sound effects for Start, Arm, and Disarm",
+        "Token gate so only you can get past the Start screen",
+        "Back button to return to the intro screen",
+        "Passwordless firewall access on macOS so Arm never prompts for a password",
+    ]),
+    ("1.2", "Windows + live updates", [
+        "Windows build via Windows Defender Firewall, packaged as Lagswitch.exe",
+        "Live updates -- push a code change and the installed app offers an Update button",
+        "Duration changed from a dropdown to a 0.5-10.0s slider (0.1s steps)",
+        "Your token, trigger key, and duration are remembered between launches",
+    ]),
+    ("1.3", "Hold mode + per-app targeting", [
+        "TOGGLE switches between timed cuts and hold-to-cut mode",
+        "Select Window (Windows): cut just one app's internet instead of the whole PC",
+        "Sounds replaced with original synthesized chimes",
+    ]),
+    ("1.4", "Arm hotkey, overlays, and safety", [
+        "Bind a separate global hotkey that arms/disarms instantly",
+        "On-screen overlays show Armed/Disarmed/Toggle status while you're in a game",
+        "Press the trigger key again mid-cut to cancel it early instead of waiting it out",
+        "Other keys held down now block a hotkey instead of misfiring, with an on-screen warning",
+        "New chimes for Toggle ON/OFF and a distinct error buzz",
+    ]),
+]
+
+
 def app_dir():
     """Per-user folder for settings (and, on Windows, the cached payload)."""
     if IS_WIN:
@@ -152,10 +190,40 @@ def _make_chime(notes, note_dur=0.18, gap=0.04):
     return buf.getvalue()
 
 
-# Three distinct voices. Frequencies are musical notes (Hz).
+def _make_buzz():
+    """Short dissonant double-buzz for the multi-key-input error -- two close,
+    beating frequencies under a fast decay so it reads as "wrong" rather than
+    a pleasant chime."""
+    frames = bytearray()
+    decay = 9.0
+    note_dur, gap = 0.09, 0.05
+    for i in range(2):
+        n = int(SAMPLE_RATE * note_dur)
+        for s in range(n):
+            t = s / SAMPLE_RATE
+            env = math.exp(-decay * t)
+            sample = math.sin(2 * math.pi * 220.0 * t) + math.sin(2 * math.pi * 233.0 * t)
+            value = int(max(-1.0, min(1.0, sample / 2.0 * env)) * 28000)
+            frames += struct.pack("<h", value)
+        if i == 0:
+            frames += b"\x00\x00" * int(SAMPLE_RATE * gap)
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(SAMPLE_RATE)
+        wf.writeframes(bytes(frames))
+    return buf.getvalue()
+
+
+# Distinct voices. Frequencies are musical notes (Hz).
 SOUND_START = _make_chime([784.0, 1046.5])           # G5 -> C6, bright rising ding
 SOUND_ARM = _make_chime([659.3, 880.0, 1174.7])      # E5 -> A5 -> D6, confident ascend
 SOUND_DISARM = _make_chime([880.0, 587.3])           # A5 -> D5, soft descend
+SOUND_TOGGLE_ON = _make_chime([523.3, 659.3], note_dur=0.12, gap=0.02)   # C5 -> E5, quick blip
+SOUND_TOGGLE_OFF = _make_chime([659.3, 523.3], note_dur=0.12, gap=0.02)  # E5 -> C5, mirrored
+SOUND_ERROR = _make_buzz()                           # dissonant double-buzz, "input failed"
 
 # On macOS we play via afplay, which needs a file path -- write each chime to a
 # temp .wav once and reuse it.
@@ -421,22 +489,41 @@ class LagswitchApp:
         settings = load_settings()
         self.unlocked = bool(settings.get("unlocked", False))
 
+        # Fresh install: nothing to announce, so silently mark the current
+        # version as already seen instead of showing "What's New" on first run.
+        self.last_seen_version = settings.get("last_seen_version")
+        first_run = self.last_seen_version is None
+        if first_run:
+            self.last_seen_version = CURRENT_VERSION
+
         self.armed = False
         self.bound_key = self._deserialize_key(settings.get("bound_key"))
         self.bound_key_label = self._key_name(self.bound_key) if self.bound_key else "Bind"
+        self.arm_key = self._deserialize_key(settings.get("arm_key"))
+        self.arm_key_label = self._key_name(self.arm_key) if self.arm_key else "Bind"
         self.duration = tk.DoubleVar(value=float(settings.get("duration", 3.0)))
         self.duration_display = tk.StringVar(value=f"{self.duration.get():.1f}s")
-        self._capturing = False
+        self._capture_mode = None  # None / "trigger" / "arm"
 
-        # Toggle ON  = timed mode (press -> cut for the slider duration).
+        # Toggle ON  = timed mode (press -> cut for the slider duration; press
+        #              again mid-cut to cancel early).
         # Toggle OFF = hold mode  (cut while the key is held, restore on release).
         self.toggle_on = bool(settings.get("toggle_on", True))
-        self._key_down = False  # debounces key-repeat in hold mode
+        self._key_down = False      # debounces key-repeat in hold mode
+        self._arm_key_down = False  # debounces key-repeat for the arm hotkey
+        self._cancel_event = threading.Event()
+
+        # Tracks every keyboard key currently held, so a hotkey can be ignored
+        # if anything else is held at the same time (see _on_global_key).
+        self._pressed_keys = set()
 
         # Per-app cut target (Windows only). None = whole system. Not persisted
         # because the chosen window may be gone by the next launch.
         self.target_program = None
         self.target_label = "Whole system"
+
+        if first_run:
+            save_settings({**settings, "last_seen_version": self.last_seen_version})
 
         root.title("7amany's Lagswitch")
         root.configure(bg=BG)
@@ -602,6 +689,10 @@ class LagswitchApp:
         if self.update_available:
             self._make_button(frame, "Update", self._do_update).pack(pady=(16, 0))
 
+        self._text_link(self.container, "Patch Notes", self.show_patch_notes).place(
+            relx=1.0, rely=1.0, x=-20, y=-20, anchor="se"
+        )
+
         self._force_redraw()
 
     def _make_token_entry(self, parent):
@@ -662,11 +753,89 @@ class LagswitchApp:
             self.token_error.config(text="Update Required")
             return
         play_sound(SOUND_START)
-        self.show_config()
+        if self.last_seen_version != CURRENT_VERSION:
+            self.last_seen_version = CURRENT_VERSION
+            self._save_settings()
+            self.show_whats_new()
+        else:
+            self.show_config()
 
     def _do_update(self):
         self.exit_action = "update"
         self.on_close()
+
+    def show_whats_new(self):
+        self._clear()
+        outer = tk.Frame(self.container, bg=BG)
+        outer.place(relx=0.5, rely=0.5, anchor="center")
+
+        self._glow_text(outer, "WHAT'S NEW", self.header_font).pack(pady=(0, 10))
+
+        version, title, bullets = CHANGELOG[-1]
+        self._make_label(
+            outer, f"v{version} — {title}", self.body_font, ACCENT
+        ).pack(pady=(0, 12))
+
+        text = tk.Text(
+            outer,
+            width=46,
+            height=min(len(bullets) * 2 + 1, 12),
+            wrap="word",
+            font=self.small_font,
+            bg=PANEL,
+            fg=TEXT,
+            relief="flat",
+            bd=0,
+            highlightthickness=2,
+            highlightbackground=ACCENT,
+            padx=14,
+            pady=12,
+        )
+        for bullet in bullets:
+            text.insert("end", f"•  {bullet}\n\n")
+        text.config(state="disabled")
+        text.pack(pady=(0, 18))
+
+        self._make_button(outer, "Next", self.show_config, big=True).pack()
+        self._force_redraw()
+
+    def show_patch_notes(self):
+        picker = tk.Toplevel(self.root)
+        picker.title("Patch Notes")
+        picker.configure(bg=BG)
+        picker.geometry("480x520")
+        picker.transient(self.root)
+
+        self._glow_text(picker, "PATCH NOTES", self.header_font).pack(pady=(16, 10))
+
+        wrap = tk.Frame(picker, bg=BG)
+        wrap.pack(fill="both", expand=True, padx=16, pady=(0, 16))
+
+        scrollbar = tk.Scrollbar(wrap)
+        scrollbar.pack(side="right", fill="y")
+        text = tk.Text(
+            wrap,
+            wrap="word",
+            font=self.small_font,
+            bg=PANEL,
+            fg=TEXT,
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
+            padx=14,
+            pady=12,
+            yscrollcommand=scrollbar.set,
+        )
+        text.pack(side="left", fill="both", expand=True)
+        scrollbar.config(command=text.yview)
+
+        for version, title, bullets in CHANGELOG:  # oldest -> newest
+            text.insert("end", f"v{version} — {title}\n", ("hdr",))
+            for bullet in bullets:
+                text.insert("end", f"   •  {bullet}\n")
+            text.insert("end", "\n")
+        text.tag_config("hdr", foreground=ACCENT, font=self.body_font)
+        text.config(state="disabled")
 
     def show_config(self):
         self._clear()
@@ -700,8 +869,12 @@ class LagswitchApp:
                 lambda row: self._badge(row, self._target_display(), command=self._select_window),
             )
 
-        self.arm_button = self._badge(outer, "Arm", command=self.toggle_arm, dark=True)
-        self.arm_button.pack(pady=(26, 10))
+        arm_row = tk.Frame(outer, bg=BG)
+        arm_row.pack(pady=(26, 10))
+        self.arm_key_button = self._badge(arm_row, self.arm_key_label, command=self.begin_capture_arm)
+        self.arm_key_button.pack(side="left", padx=(0, 10))
+        self.arm_button = self._badge(arm_row, "Arm", command=self.toggle_arm, dark=True)
+        self.arm_button.pack(side="left")
 
         self.status_label = self._make_label(outer, "Disarmed", self.small_font, TEXT_DIM)
         self.status_label.pack()
@@ -795,6 +968,10 @@ class LagswitchApp:
         self.toggle_button.config(text="ON" if self.toggle_on else "OFF")
         self._apply_slider_state()
         self._save_settings()
+        play_sound(SOUND_TOGGLE_ON if self.toggle_on else SOUND_TOGGLE_OFF)
+        self._flash_overlay(
+            "top_left", f"TOGGLE {'ON' if self.toggle_on else 'OFF'}", ACCENT
+        )
 
     # -- Select Window: per-app cut target (Windows only) -------------------
     def _target_display(self):
@@ -866,25 +1043,43 @@ class LagswitchApp:
 
     # -- Keybind capture ----------------------------------------------------
     def begin_capture(self):
-        if self._capturing:
+        if self._capture_mode is not None:
             return
         if self.armed:
             self.set_status("Disarm before changing the keybind.", TEXT_DIM)
             return
-        self._capturing = True
+        self._capture_mode = "trigger"
         self.key_button.config(text="Press a key…")
         # The next key is caught by the single long-lived listener below.
 
     def _finish_capture(self, key):
         self.bound_key = key
         self.bound_key_label = self._key_name(key)
-        self._capturing = False
+        self._capture_mode = None
+        self._refresh_key_button()
+        self._save_settings()
+
+    def begin_capture_arm(self):
+        if self._capture_mode is not None:
+            return
+        if self.armed:
+            self.set_status("Disarm before changing the arm hotkey.", TEXT_DIM)
+            return
+        self._capture_mode = "arm"
+        self.arm_key_button.config(text="Press a key…")
+
+    def _finish_capture_arm(self, key):
+        self.arm_key = key
+        self.arm_key_label = self._key_name(key)
+        self._capture_mode = None
         self._refresh_key_button()
         self._save_settings()
 
     def _refresh_key_button(self):
         if hasattr(self, "key_button"):
             self.key_button.config(text=self.bound_key_label)
+        if hasattr(self, "arm_key_button"):
+            self.arm_key_button.config(text=self.arm_key_label)
 
     @staticmethod
     def _key_name(key):
@@ -920,37 +1115,59 @@ class LagswitchApp:
     def _save_settings(self):
         save_settings({
             "bound_key": self._serialize_key(self.bound_key),
+            "arm_key": self._serialize_key(self.arm_key),
             "duration": self.duration.get(),
             "unlocked": self.unlocked,
             "toggle_on": self.toggle_on,
+            "last_seen_version": self.last_seen_version,
         })
 
     # -- Global trigger -----------------------------------------------------
     def _on_global_key(self, key):
-        if self._capturing:
+        # Track every held key first, regardless of what else happens below --
+        # this is what lets the multi-key guard see "what else is down right now".
+        self._pressed_keys.add(key)
+
+        if self._capture_mode == "trigger":
             self.root.after(0, self._finish_capture, key)
             return
-        if not self.armed or self.bound_key is None:
+        if self._capture_mode == "arm":
+            self.root.after(0, self._finish_capture_arm, key)
             return
-        if not self._keys_equal(key, self.bound_key):
-            return
-        if self.toggle_on:
-            # Timed mode: ignore repeats while a cut is already running.
-            if self.engine.is_cutting:
-                return
-            self.root.after(0, self.trigger_cut)
-        else:
-            # Hold mode: cut on the first press, ignore key-repeat until release.
-            if self._key_down:
-                return
-            self._key_down = True
-            self.root.after(0, self._start_hold_cut)
+
+        if self.armed and self.bound_key is not None and self._keys_equal(key, self.bound_key):
+            if len(self._pressed_keys) > 1:
+                self.root.after(0, self._reject_multi_key)
+            elif self.toggle_on:
+                # Timed mode: a press while already cutting cancels it early
+                # instead of being ignored.
+                if self.engine.is_cutting:
+                    self.root.after(0, self.cancel_cut)
+                else:
+                    self.root.after(0, self.trigger_cut)
+            else:
+                # Hold mode: cut on the first press, ignore key-repeat until release.
+                if not self._key_down:
+                    self._key_down = True
+                    self.root.after(0, self._start_hold_cut)
+
+        if self.arm_key is not None and self._keys_equal(key, self.arm_key):
+            if len(self._pressed_keys) > 1:
+                self.root.after(0, self._reject_multi_key)
+            elif not self._arm_key_down:
+                self._arm_key_down = True
+                self.root.after(0, self.toggle_arm)
 
     def _on_global_key_release(self, key):
+        self._pressed_keys.discard(key)
+
         if not self.toggle_on and self.bound_key is not None:
             if self._keys_equal(key, self.bound_key):
                 self._key_down = False
                 self.root.after(0, self._end_hold_cut)
+
+        if self.arm_key is not None and self._keys_equal(key, self.arm_key):
+            self._arm_key_down = False
 
     @staticmethod
     def _keys_equal(a, b):
@@ -979,11 +1196,15 @@ class LagswitchApp:
         if not ok:
             self.set_status(msg, DANGER)
             return
+        # Reset the held-keys tracker so a stale/missed release from before
+        # arming can't permanently block the multi-key guard.
+        self._pressed_keys = set()
         self.armed = True
         self.arm_button.config(text="Disarm")
         verb = "press" if self.toggle_on else "hold"
         self.set_status(f"Armed — {verb} {self.bound_key_label}", ACCENT)
         play_sound(SOUND_ARM)
+        self._flash_overlay("top_left", f"ARMED — {verb} {self.bound_key_label}", ACCENT)
 
     def disarm(self):
         self.armed = False
@@ -993,23 +1214,31 @@ class LagswitchApp:
         self.arm_button.config(text="Arm")
         self.set_status("Disarmed", TEXT_DIM)
         play_sound(SOUND_DISARM)
+        self._flash_overlay("top_left", "DISARMED", TEXT)
 
     # -- The cut ------------------------------------------------------------
     def trigger_cut(self):
         if self.engine.is_cutting or not self.armed:
             return
+        self._cancel_event.clear()
         seconds = self.duration.get()
         worker = threading.Thread(
             target=self._cut_worker, args=(seconds,), daemon=True
         )
         worker.start()
 
+    def cancel_cut(self):
+        if self.engine.is_cutting:
+            self._cancel_event.set()
+
     def _cut_worker(self, seconds):
         ok, msg = self.engine.cut(self.target_program)
         if not ok:
             self._ui(lambda: self.set_status(f"Cut failed: {msg}", DANGER))
             return
-        # Count down while cut.
+        # Count down while cut -- a cancel makes the wait return early so the
+        # loop breaks right away and falls through to the same restore path
+        # used when the timer simply runs out.
         end = time.monotonic() + seconds
         while True:
             remaining = end - time.monotonic()
@@ -1020,7 +1249,8 @@ class LagswitchApp:
                     f"CUT — {max(r, 0):.1f}s left", DANGER
                 )
             )
-            time.sleep(min(0.1, remaining))
+            if self._cancel_event.wait(timeout=min(0.1, remaining)):
+                break
         self._ui(lambda: self.set_status("Reconnecting…", TEXT_DIM))
         ok, msg = self.engine.restore()
         if not ok:
@@ -1077,6 +1307,60 @@ class LagswitchApp:
     def _exit_fullscreen(self, _event=None):
         self._fullscreen = False
         self.root.attributes("-fullscreen", False)
+
+    # -- Anti-ghost-input guard ----------------------------------------------
+    def _reject_multi_key(self):
+        play_sound(SOUND_ERROR)
+        self._flash_overlay(
+            "top_right", "INPUT FAILED — MULTIPLE KEYS PRESSED", DANGER
+        )
+
+    # -- On-screen overlays (separate always-on-top windows, not the app UI) -
+    def _overlay(self, corner):
+        attr = f"_overlay_{corner}"
+        win = getattr(self, attr, None)
+        if win is not None and win.winfo_exists():
+            return win
+        win = tk.Toplevel(self.root)
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        try:
+            win.attributes("-alpha", 0.94)
+        except tk.TclError:
+            pass
+        win.configure(bg=PANEL)
+        label = self._make_label(win, "", self.body_font, TEXT, PANEL)
+        label.config(highlightthickness=2, highlightbackground=ACCENT, padx=16, pady=12)
+        label.pack()
+        win.withdraw()
+        setattr(self, attr, win)
+        setattr(self, f"{attr}_label", label)
+        return win
+
+    def _flash_overlay(self, corner, text, color=TEXT, duration_ms=1600):
+        win = self._overlay(corner)
+        label = getattr(self, f"_overlay_{corner}_label")
+        label.config(text=text, fg=color)
+        win.update_idletasks()
+        w, h = win.winfo_reqwidth(), win.winfo_reqheight()
+        margin = 24
+        if corner == "top_left":
+            x, y = margin, margin
+        else:  # top_right
+            x, y = win.winfo_screenwidth() - w - margin, margin
+        win.geometry(f"{w}x{h}+{x}+{y}")
+        win.deiconify()
+        win.lift()
+
+        timer_attr = f"_overlay_{corner}_timer"
+        existing = getattr(self, timer_attr, None)
+        if existing is not None:
+            try:
+                self.root.after_cancel(existing)
+            except Exception:  # noqa: BLE001
+                pass
+        new_timer = self.root.after(duration_ms, win.withdraw)
+        setattr(self, timer_attr, new_timer)
 
     # -- Utilities ----------------------------------------------------------
     def _ui(self, fn):
