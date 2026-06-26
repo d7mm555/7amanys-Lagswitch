@@ -18,7 +18,7 @@ jobs:
         run: pip install pynput pyinstaller
 
       - name: Build Lagswitch.exe
-        run: pyinstaller --onefile --windowed --uac-admin --name Lagswitch --add-data "lagswitch.py;." --collect-all pynput --hidden-import json --hidden-import hashlib --hidden-import threading --hidden-import subprocess --hidden-import tkinter --hidden-import tkinter.font --hidden-import ctypes --hidden-import winsound launcher.py
+        run: pyinstaller --onefile --windowed --uac-admin --name Lagswitch --add-data "lagswitch.py;." --collect-all pynput --hidden-import json --hidden-import hashlib --hidden-import threading --hidden-import subprocess --hidden-import tkinter --hidden-import tkinter.font --hidden-import ctypes --hidden-import ctypes.wintypes --hidden-import winsound --hidden-import io --hidden-import math --hidden-import struct --hidden-import wave launcher.py
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
