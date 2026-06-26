@@ -20,13 +20,17 @@ Run:  python3 lagswitch.py   (macOS)   /   double-click Lagswitch.exe (Windows)
 """
 
 import hashlib
+import io
 import json
+import math
 import os
+import struct
 import subprocess
 import sys
 import threading
 import time
 import tkinter as tk
+import wave
 from tkinter import font as tkfont
 
 IS_WIN = sys.platform.startswith("win")
@@ -34,6 +38,7 @@ IS_MAC = sys.platform == "darwin"
 
 if IS_WIN:
     import ctypes
+    from ctypes import wintypes
     import winsound
     # Stops a black cmd window from flashing on every netsh call.
     CREATE_NO_WINDOW = 0x08000000
@@ -66,16 +71,6 @@ BADGE_FG = "#2a0845"      # dark purple text on light badges
 BLOCK_RULES = "set block-policy drop\nset skip on lo0\nblock drop all\n"
 BLOCK_CONF_PATH = "/tmp/lagswitch_block.conf"
 DEFAULT_PF_CONF = "/etc/pf.conf"
-
-# System sounds, per platform (no bundled audio needed).
-if IS_WIN:
-    SOUND_START = "SystemAsterisk"
-    SOUND_ARM = "SystemExclamation"
-    SOUND_DISARM = "SystemHand"
-else:
-    SOUND_START = "/System/Library/Sounds/Tink.aiff"
-    SOUND_ARM = "/System/Library/Sounds/Glass.aiff"
-    SOUND_DISARM = "/System/Library/Sounds/Pop.aiff"
 
 # SHA-256 of the one valid access token -- the plaintext is never stored here.
 TOKEN_HASH = "15266e80c93db00dde82b79c2144c1cfe7592c533032be9d613a7a7c20f9658f"
@@ -121,19 +116,78 @@ def save_settings(data):
         pass
 
 
-def play_sound(name_or_path):
-    """Fire-and-forget playback; never blocks the UI."""
+# --- Chime synthesis -------------------------------------------------------
+# Original bell-like chimes, generated in code so no audio files are bundled
+# (keeps everything inside lagswitch.py, so sounds update live too). Each note
+# is a fundamental plus a couple of quieter harmonics under an exponential
+# decay envelope -- the decay is what gives it that soft "chime" ring.
+SAMPLE_RATE = 44100
+
+
+def _make_chime(notes, note_dur=0.18, gap=0.04):
+    """notes: list of frequencies played in sequence. Returns 16-bit mono WAV bytes."""
+    frames = bytearray()
+    decay = 5.0  # higher = shorter, more bell-like ring
+    for i, freq in enumerate(notes):
+        n = int(SAMPLE_RATE * note_dur)
+        for s in range(n):
+            t = s / SAMPLE_RATE
+            env = math.exp(-decay * t)
+            sample = (
+                1.00 * math.sin(2 * math.pi * freq * t)
+                + 0.45 * math.sin(2 * math.pi * freq * 2 * t)
+                + 0.20 * math.sin(2 * math.pi * freq * 3 * t)
+            )
+            value = int(max(-1.0, min(1.0, sample / 1.65 * env)) * 28000)
+            frames += struct.pack("<h", value)
+        if i < len(notes) - 1:
+            frames += b"\x00\x00" * int(SAMPLE_RATE * gap)
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(SAMPLE_RATE)
+        wf.writeframes(bytes(frames))
+    return buf.getvalue()
+
+
+# Three distinct voices. Frequencies are musical notes (Hz).
+SOUND_START = _make_chime([784.0, 1046.5])           # G5 -> C6, bright rising ding
+SOUND_ARM = _make_chime([659.3, 880.0, 1174.7])      # E5 -> A5 -> D6, confident ascend
+SOUND_DISARM = _make_chime([880.0, 587.3])           # A5 -> D5, soft descend
+
+# On macOS we play via afplay, which needs a file path -- write each chime to a
+# temp .wav once and reuse it.
+_SOUND_FILES = {}
+
+
+def _sound_file(wav_bytes):
+    path = _SOUND_FILES.get(id(wav_bytes))
+    if path is None:
+        path = os.path.join(app_dir(), f"chime_{id(wav_bytes)}.wav")
+        try:
+            with open(path, "wb") as fh:
+                fh.write(wav_bytes)
+        except OSError:
+            return None
+        _SOUND_FILES[id(wav_bytes)] = path
+    return path
+
+
+def play_sound(wav_bytes):
+    """Fire-and-forget playback of synthesized chime bytes; never blocks the UI."""
     try:
         if IS_WIN:
-            winsound.PlaySound(
-                name_or_path, winsound.SND_ALIAS | winsound.SND_ASYNC
-            )
+            winsound.PlaySound(wav_bytes, winsound.SND_MEMORY | winsound.SND_ASYNC)
         else:
-            subprocess.Popen(
-                ["afplay", name_or_path],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
+            path = _sound_file(wav_bytes)
+            if path:
+                subprocess.Popen(
+                    ["afplay", path],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
     except Exception:  # noqa: BLE001 - a missing sound shouldn't break the app
         pass
 
@@ -193,8 +247,13 @@ class MacEngine(_EngineBase):
             )
         return True, "ready"
 
-    def cut(self):
-        """Block all traffic. Returns (ok, message)."""
+    def cut(self, target_program=None):
+        """Block all traffic. Returns (ok, message).
+
+        target_program is accepted for API parity with the Windows engine but
+        ignored -- pf can't cleanly scope a cut to a single process, so macOS
+        always does a whole-system cut.
+        """
         with self._lock:
             try:
                 with open(BLOCK_CONF_PATH, "w") as fh:
@@ -238,16 +297,19 @@ class WindowsEngine(_EngineBase):
             return False, "Lagswitch needs to run as administrator -- relaunch the .exe"
         return True, "ready"
 
-    def cut(self):
+    def cut(self, target_program=None):
+        """Block traffic. If target_program (an .exe path) is given, only that
+        program's traffic is blocked; otherwise everything is cut."""
         with self._lock:
+            extra = [f"program={target_program}"] if target_program else []
             ok_out, err_out = self._run([
                 "netsh", "advfirewall", "firewall", "add", "rule",
                 f"name={FW_RULE_OUT}", "dir=out", "action=block",
-            ])
+            ] + extra)
             ok_in, err_in = self._run([
                 "netsh", "advfirewall", "firewall", "add", "rule",
                 f"name={FW_RULE_IN}", "dir=in", "action=block",
-            ])
+            ] + extra)
             if ok_out and ok_in:
                 self._cutting = True
                 return True, "cut"
@@ -276,6 +338,78 @@ def make_engine():
     return WindowsEngine() if IS_WIN else MacEngine()
 
 
+# --- Window enumeration (Windows only) -------------------------------------
+def enumerate_windows(own_hwnd=None):
+    """List visible, titled top-level windows as [{title, exe, name}].
+
+    Windows-only: walks EnumWindows, resolves each window's owning process to
+    its .exe path so the firewall can scope a cut to just that program. Returns
+    [] on any other platform. De-duplicates by exe so one app shows once.
+    """
+    if not IS_WIN:
+        return []
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+
+    results = []
+    seen_exes = set()
+
+    EnumWindowsProc = ctypes.WINFUNCTYPE(
+        wintypes.BOOL, wintypes.HWND, wintypes.LPARAM
+    )
+
+    def _exe_for_pid(pid):
+        handle = kernel32.OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION, False, pid
+        )
+        if not handle:
+            return None
+        try:
+            size = wintypes.DWORD(32768)
+            buf = ctypes.create_unicode_buffer(size.value)
+            if kernel32.QueryFullProcessImageNameW(
+                handle, 0, buf, ctypes.byref(size)
+            ):
+                return buf.value
+        finally:
+            kernel32.CloseHandle(handle)
+        return None
+
+    def _callback(hwnd, _lparam):
+        if hwnd == own_hwnd:
+            return True
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        length = user32.GetWindowTextLengthW(hwnd)
+        if length == 0:
+            return True
+        title_buf = ctypes.create_unicode_buffer(length + 1)
+        user32.GetWindowTextW(hwnd, title_buf, length + 1)
+        title = title_buf.value.strip()
+        if not title:
+            return True
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        exe = _exe_for_pid(pid.value)
+        if not exe or exe in seen_exes:
+            return True
+        seen_exes.add(exe)
+        results.append({
+            "title": title,
+            "exe": exe,
+            "name": os.path.basename(exe),
+        })
+        return True
+
+    try:
+        user32.EnumWindows(EnumWindowsProc(_callback), 0)
+    except Exception:  # noqa: BLE001 - never let enumeration crash the app
+        pass
+    return results
+
+
 # --- Application -----------------------------------------------------------
 class LagswitchApp:
     def __init__(self, root, update_available=False):
@@ -293,6 +427,16 @@ class LagswitchApp:
         self.duration = tk.DoubleVar(value=float(settings.get("duration", 3.0)))
         self.duration_display = tk.StringVar(value=f"{self.duration.get():.1f}s")
         self._capturing = False
+
+        # Toggle ON  = timed mode (press -> cut for the slider duration).
+        # Toggle OFF = hold mode  (cut while the key is held, restore on release).
+        self.toggle_on = bool(settings.get("toggle_on", True))
+        self._key_down = False  # debounces key-repeat in hold mode
+
+        # Per-app cut target (Windows only). None = whole system. Not persisted
+        # because the chosen window may be gone by the next launch.
+        self.target_program = None
+        self.target_label = "Whole system"
 
         root.title("7amany's Lagswitch")
         root.configure(bg=BG)
@@ -324,7 +468,10 @@ class LagswitchApp:
         # Listener is ever created -- running a second one concurrently (e.g.
         # for keybind capture) has been observed to crash the process on macOS.
         try:
-            self.listener = keyboard.Listener(on_press=self._on_global_key)
+            self.listener = keyboard.Listener(
+                on_press=self._on_global_key,
+                on_release=self._on_global_key_release,
+            )
             self.listener.daemon = True
             self.listener.start()
         except Exception as exc:  # noqa: BLE001
@@ -530,6 +677,14 @@ class LagswitchApp:
             outer, "LAGSWITCH SETTINGS", self.header_font
         ).pack(anchor="w", pady=(0, 18))
 
+        _, self.toggle_button = self._connector_row(
+            outer,
+            "TOGGLE",
+            lambda row: self._badge(
+                row, "ON" if self.toggle_on else "OFF", command=self._toggle_mode
+            ),
+        )
+
         _, self.key_button = self._connector_row(
             outer,
             "TRIGGER KEY",
@@ -537,6 +692,13 @@ class LagswitchApp:
         )
 
         self._connector_row(outer, "DISCONNECT FOR", self._build_duration_slider)
+
+        if IS_WIN:
+            _, self.target_button = self._connector_row(
+                outer,
+                "TARGET",
+                lambda row: self._badge(row, self._target_display(), command=self._select_window),
+            )
 
         self.arm_button = self._badge(outer, "Arm", command=self.toggle_arm, dark=True)
         self.arm_button.pack(pady=(26, 10))
@@ -608,7 +770,99 @@ class LagswitchApp:
         )
         slider.bind("<ButtonRelease-1>", on_release)
         slider.pack(side="left")
+        self.duration_slider = slider
+        self.duration_value_badge = value_badge
+        self._apply_slider_state()
         return wrap
+
+    def _apply_slider_state(self):
+        """In hold mode the slider is unused, so grey it out."""
+        if not hasattr(self, "duration_slider"):
+            return
+        if self.toggle_on:
+            self.duration_slider.config(state="normal", fg=ACCENT, troughcolor=PANEL)
+            self.duration_value_badge.config(fg=BADGE_FG)
+        else:
+            self.duration_slider.config(state="disabled", fg=TEXT_DIM, troughcolor=BG)
+            self.duration_value_badge.config(fg=TEXT_DIM)
+
+    # -- Toggle: timed (ON) vs hold (OFF) -----------------------------------
+    def _toggle_mode(self):
+        if self.armed:
+            self.set_status("Disarm before switching mode.", TEXT_DIM)
+            return
+        self.toggle_on = not self.toggle_on
+        self.toggle_button.config(text="ON" if self.toggle_on else "OFF")
+        self._apply_slider_state()
+        self._save_settings()
+
+    # -- Select Window: per-app cut target (Windows only) -------------------
+    def _target_display(self):
+        return "Select Window" if self.target_program is None else self.target_label
+
+    def _select_window(self):
+        if self.armed:
+            self.set_status("Disarm before changing the target.", TEXT_DIM)
+            return
+        own_hwnd = None
+        try:
+            own_hwnd = self.root.winfo_id()
+        except Exception:  # noqa: BLE001
+            pass
+        windows = enumerate_windows(own_hwnd)
+
+        picker = tk.Toplevel(self.root)
+        picker.title("Select Window")
+        picker.configure(bg=BG)
+        picker.geometry("420x460")
+        picker.transient(self.root)
+
+        self._glow_text(picker, "SELECT WINDOW", self.header_font).pack(pady=(16, 10))
+
+        listbox_wrap = tk.Frame(picker, bg=BG)
+        listbox_wrap.pack(fill="both", expand=True, padx=16, pady=(0, 16))
+
+        scrollbar = tk.Scrollbar(listbox_wrap)
+        scrollbar.pack(side="right", fill="y")
+        listbox = tk.Listbox(
+            listbox_wrap,
+            font=self.small_font,
+            bg=PANEL,
+            fg=TEXT,
+            selectbackground=ACCENT,
+            selectforeground="white",
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
+            activestyle="none",
+            yscrollcommand=scrollbar.set,
+        )
+        listbox.pack(side="left", fill="both", expand=True)
+        scrollbar.config(command=listbox.yview)
+
+        # First entry reverts to a whole-system cut.
+        entries = [{"title": "Whole system (all apps)", "exe": None, "name": ""}]
+        entries += windows
+        for item in entries:
+            label = item["title"]
+            if item["exe"]:
+                label = f"{item['title']}  —  {item['name']}"
+            listbox.insert("end", label)
+
+        def choose():
+            sel = listbox.curselection()
+            if sel:
+                self._apply_target(entries[sel[0]])
+            picker.destroy()
+
+        self._make_button(picker, "Select", choose, big=True).pack(pady=(0, 16))
+        listbox.bind("<Double-Button-1>", lambda _e: choose())
+
+    def _apply_target(self, item):
+        self.target_program = item["exe"]
+        self.target_label = item["name"] if item["exe"] else "Whole system"
+        if hasattr(self, "target_button"):
+            self.target_button.config(text=self._target_display())
 
     # -- Keybind capture ----------------------------------------------------
     def begin_capture(self):
@@ -668,6 +922,7 @@ class LagswitchApp:
             "bound_key": self._serialize_key(self.bound_key),
             "duration": self.duration.get(),
             "unlocked": self.unlocked,
+            "toggle_on": self.toggle_on,
         })
 
     # -- Global trigger -----------------------------------------------------
@@ -677,10 +932,25 @@ class LagswitchApp:
             return
         if not self.armed or self.bound_key is None:
             return
-        if self.engine.is_cutting:
+        if not self._keys_equal(key, self.bound_key):
             return
-        if self._keys_equal(key, self.bound_key):
+        if self.toggle_on:
+            # Timed mode: ignore repeats while a cut is already running.
+            if self.engine.is_cutting:
+                return
             self.root.after(0, self.trigger_cut)
+        else:
+            # Hold mode: cut on the first press, ignore key-repeat until release.
+            if self._key_down:
+                return
+            self._key_down = True
+            self.root.after(0, self._start_hold_cut)
+
+    def _on_global_key_release(self, key):
+        if not self.toggle_on and self.bound_key is not None:
+            if self._keys_equal(key, self.bound_key):
+                self._key_down = False
+                self.root.after(0, self._end_hold_cut)
 
     @staticmethod
     def _keys_equal(a, b):
@@ -711,7 +981,8 @@ class LagswitchApp:
             return
         self.armed = True
         self.arm_button.config(text="Disarm")
-        self.set_status(f"Armed — press {self.bound_key_label}", ACCENT)
+        verb = "press" if self.toggle_on else "hold"
+        self.set_status(f"Armed — {verb} {self.bound_key_label}", ACCENT)
         play_sound(SOUND_ARM)
 
     def disarm(self):
@@ -734,7 +1005,7 @@ class LagswitchApp:
         worker.start()
 
     def _cut_worker(self, seconds):
-        ok, msg = self.engine.cut()
+        ok, msg = self.engine.cut(self.target_program)
         if not ok:
             self._ui(lambda: self.set_status(f"Cut failed: {msg}", DANGER))
             return
@@ -765,6 +1036,39 @@ class LagswitchApp:
                 )
             )
 
+    # -- Hold-mode cut (toggle OFF: cut while key is held) ------------------
+    def _start_hold_cut(self):
+        if self.engine.is_cutting or not self.armed:
+            return
+        threading.Thread(target=self._hold_cut_worker, daemon=True).start()
+
+    def _hold_cut_worker(self):
+        ok, msg = self.engine.cut(self.target_program)
+        if not ok:
+            self._ui(lambda: self.set_status(f"Cut failed: {msg}", DANGER))
+            return
+        self._ui(lambda: self.set_status("CUT — holding…", DANGER))
+
+    def _end_hold_cut(self):
+        if not self.engine.is_cutting:
+            return
+        threading.Thread(target=self._hold_restore_worker, daemon=True).start()
+
+    def _hold_restore_worker(self):
+        # Do the reconnect FIRST, then update the UI -- the network restore must
+        # never be gated behind a (cross-thread) UI call.
+        ok, msg = self.engine.restore()
+        if not ok:
+            self._ui(lambda: self.set_status(f"Reconnect issue: {msg}", DANGER))
+        elif self.armed:
+            self._ui(
+                lambda: self.set_status(
+                    f"Armed — hold {self.bound_key_label}", ACCENT
+                )
+            )
+        else:
+            self._ui(lambda: self.set_status("Disarmed", TEXT_DIM))
+
     # -- Full-screen (Windows only; macOS has the native green button) ------
     def _toggle_fullscreen(self, _event=None):
         self._fullscreen = not self._fullscreen
@@ -776,10 +1080,16 @@ class LagswitchApp:
 
     # -- Utilities ----------------------------------------------------------
     def _ui(self, fn):
-        """Schedule a callable on the Tk main thread."""
+        """Schedule a callable on the Tk main thread.
+
+        Catches *everything*: this is called from worker threads, and a flaky
+        cross-thread Tk call must never propagate and kill a worker before it
+        finishes the actual network restore (which would strand the user
+        offline).
+        """
         try:
             self.root.after(0, fn)
-        except RuntimeError:
+        except Exception:  # noqa: BLE001
             pass
 
     def set_status(self, text, color=TEXT_DIM):
