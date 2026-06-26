@@ -1,0 +1,27 @@
+name: Build Windows .exe
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install pynput pyinstaller
+
+      - name: Build Lagswitch.exe
+        run: pyinstaller --onefile --windowed --uac-admin --name Lagswitch lagswitch.py
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Lagswitch-Windows
+          path: dist/Lagswitch.exe
