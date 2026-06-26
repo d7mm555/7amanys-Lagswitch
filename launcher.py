@@ -17,6 +17,15 @@ import os
 import sys
 import urllib.request
 
+# The payload (lagswitch.py) is loaded dynamically at runtime, so PyInstaller's
+# static analysis can't see what it imports. Importing the heavyweight runtime
+# pieces here guarantees PyInstaller bundles them -- especially tkinter, whose
+# hook must run to ship the Tcl/Tk data files. pynput is handled by the build's
+# --collect-all flag; the rest of the stdlib modules are covered by
+# --hidden-import in the workflow.
+import tkinter  # noqa: F401
+import tkinter.font  # noqa: F401
+
 RAW_URL = "https://raw.githubusercontent.com/d7mm555/7amanys-Lagswitch/main/lagswitch.py"
 FETCH_TIMEOUT = 4
 
