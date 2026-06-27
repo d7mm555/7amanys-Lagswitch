@@ -140,7 +140,7 @@ def validate_token(token):
 # Bump CURRENT_VERSION and append one CHANGELOG entry every time a feature batch
 # ships -- this is what drives the one-time "What's New" screen after an update
 # and the manual Patch Notes view. Oldest entry first.
-CURRENT_VERSION = "1.5"
+CURRENT_VERSION = "1.6"
 CHANGELOG = [
     ("1.0", "First release", [
         "Bind a global trigger key and pick a disconnect duration (1-10s)",
@@ -177,6 +177,11 @@ CHANGELOG = [
         "Trigger is blocked if any other key was pressed within the last 50ms",
         "Tokens are now validated in the cloud and lock to the first device that uses them",
         "Renamed the app to Webcam",
+    ]),
+    ("1.6", "Fixes + on-screen countdown", [
+        "Fixed no sound playing on Windows",
+        "Fixed the 'Input Failed' warning getting stuck until you disarmed/re-armed",
+        "Added an on-screen countdown timer (top-center) while a timed cut is active",
     ]),
 ]
 
@@ -312,8 +317,9 @@ SOUND_TOGGLE_ON = _make_chime([523.3, 659.3], note_dur=0.12, gap=0.02)   # C5 ->
 SOUND_TOGGLE_OFF = _make_chime([659.3, 523.3], note_dur=0.12, gap=0.02)  # E5 -> C5, mirrored
 SOUND_ERROR = _make_buzz()                           # dissonant double-buzz, "input failed"
 
-# On macOS we play via afplay, which needs a file path -- write each chime to a
-# temp .wav once and reuse it.
+# Both platforms play from an on-disk .wav: macOS needs a path for afplay, and on
+# Windows SND_FILENAME is far more reliable than SND_MEMORY (which is picky about
+# WAV headers and was producing no audio). Each chime is written once and reused.
 _SOUND_FILES = {}
 
 
@@ -333,16 +339,20 @@ def _sound_file(wav_bytes):
 def play_sound(wav_bytes):
     """Fire-and-forget playback of synthesized chime bytes; never blocks the UI."""
     try:
+        path = _sound_file(wav_bytes)
+        if not path:
+            return
         if IS_WIN:
-            winsound.PlaySound(wav_bytes, winsound.SND_MEMORY | winsound.SND_ASYNC)
+            winsound.PlaySound(
+                path,
+                winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT,
+            )
         else:
-            path = _sound_file(wav_bytes)
-            if path:
-                subprocess.Popen(
-                    ["afplay", path],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
+            subprocess.Popen(
+                ["afplay", path],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
     except Exception:  # noqa: BLE001 - a missing sound shouldn't break the app
         pass
 
@@ -603,11 +613,11 @@ class WebcamApp:
         self._toggle_key_down = False  # debounces key-repeat for the toggle hotkey
         self._cancel_event = threading.Event()
 
-        # Tracks every keyboard key currently held, so a hotkey can be ignored
-        # if anything else is held at the same time (see _on_global_key).
-        self._pressed_keys = set()
-        # When each key was last pressed (key -> time.monotonic()), so the trigger
-        # can require a 50ms window with no other key pressed just before it.
+        # When each key was last pressed (stable key id -> time.monotonic()), so a
+        # hotkey can require a ~50ms window with no other key pressed just before it.
+        # Keyed by _key_id (not raw pynput objects) because on Windows the release
+        # event hands back a different object than the press, which used to leak a
+        # never-emptying "held keys" set and stick the multi-key warning on forever.
         self._key_press_times = {}
 
         # Per-app cut target (Windows only). None = whole system. Not persisted
@@ -1259,23 +1269,37 @@ class WebcamApp:
             "last_seen_version": self.last_seen_version,
         })
 
+    @staticmethod
+    def _key_id(key):
+        """Stable, hashable identity for a key that's the *same on press and
+        release* (and matches a key rebuilt from settings). Raw pynput objects
+        differ between press and release on Windows, so we normalize to a scalar:
+        the printable char, else the virtual-key code, else the string name."""
+        char = getattr(key, "char", None)
+        if char:
+            return char.lower()
+        vk = getattr(key, "vk", None)
+        if vk is not None:
+            return f"vk{vk}"
+        return str(key)
+
     def _other_key_recent(self, hotkey, window=0.05):
         """True if any key other than `hotkey` was pressed within `window`
-        seconds of now -- used to require a 50ms quiet gap before the trigger."""
+        seconds of now -- used to require a 50ms quiet gap before a hotkey fires.
+        Self-pruning by time, so it can never get permanently stuck."""
         now = time.monotonic()
-        for k, t in self._key_press_times.items():
-            if now - t < window and not self._keys_equal(k, hotkey):
+        hotkey_id = self._key_id(hotkey)
+        for kid, t in self._key_press_times.items():
+            if now - t < window and kid != hotkey_id:
                 return True
         return False
 
     # -- Global trigger -----------------------------------------------------
     def _on_global_key(self, key):
-        # Track every held key + its press time first, regardless of what else
-        # happens below -- this drives both the "what else is down" guard and the
-        # 50ms "quiet window" guard.
+        # Record this key's press time first (under a stable id), regardless of
+        # what else happens below -- this drives the 50ms "quiet window" guard.
         now = time.monotonic()
-        self._pressed_keys.add(key)
-        self._key_press_times[key] = now
+        self._key_press_times[self._key_id(key)] = now
         # Prune stale timestamps so the dict can't grow without bound.
         if len(self._key_press_times) > 24:
             self._key_press_times = {
@@ -1293,9 +1317,10 @@ class WebcamApp:
             return
 
         if self.armed and self.bound_key is not None and self._keys_equal(key, self.bound_key):
-            # Trigger guard: nothing else held, AND no other key pressed in the
-            # last 50ms (rejects a quick tap right before the trigger).
-            if len(self._pressed_keys) > 1 or self._other_key_recent(self.bound_key):
+            # Trigger guard: reject if any *other* key was pressed in the last 50ms
+            # (covers both a held movement key, which auto-repeats, and a quick tap
+            # right before the trigger). Time-pruned, so it can never stick.
+            if self._other_key_recent(self.bound_key):
                 self.root.after(0, self._reject_multi_key)
             elif self.toggle_on:
                 # Timed mode: a press while already cutting cancels it early
@@ -1311,31 +1336,33 @@ class WebcamApp:
                     self.root.after(0, self._start_hold_cut)
 
         if self.arm_key is not None and self._keys_equal(key, self.arm_key):
-            if len(self._pressed_keys) > 1:
+            if self._other_key_recent(self.arm_key):
                 self.root.after(0, self._reject_multi_key)
             elif not self._arm_key_down:
                 self._arm_key_down = True
                 self.root.after(0, self.toggle_arm)
 
         if self.toggle_key is not None and self._keys_equal(key, self.toggle_key):
-            if len(self._pressed_keys) > 1:
+            if self._other_key_recent(self.toggle_key):
                 self.root.after(0, self._reject_multi_key)
             elif not self._toggle_key_down:
                 self._toggle_key_down = True
                 self.root.after(0, self._toggle_mode)
 
     def _on_global_key_release(self, key):
-        self._pressed_keys.discard(key)
+        # Match by stable id so a release object that differs from the press
+        # object still clears the debounce flag (else hold mode could stick on).
+        rid = self._key_id(key)
 
         if not self.toggle_on and self.bound_key is not None:
-            if self._keys_equal(key, self.bound_key):
+            if rid == self._key_id(self.bound_key):
                 self._key_down = False
                 self.root.after(0, self._end_hold_cut)
 
-        if self.arm_key is not None and self._keys_equal(key, self.arm_key):
+        if self.arm_key is not None and rid == self._key_id(self.arm_key):
             self._arm_key_down = False
 
-        if self.toggle_key is not None and self._keys_equal(key, self.toggle_key):
+        if self.toggle_key is not None and rid == self._key_id(self.toggle_key):
             self._toggle_key_down = False
 
     @staticmethod
@@ -1365,9 +1392,8 @@ class WebcamApp:
         if not ok:
             self.set_status(msg, DANGER)
             return
-        # Reset the held-keys trackers so a stale/missed release from before
-        # arming can't permanently block the guards.
-        self._pressed_keys = set()
+        # Clear recent-press history so a tap right before arming can't block
+        # the very first trigger.
         self._key_press_times = {}
         self.armed = True
         self.arm_button.config(text="Disarm")
@@ -1378,9 +1404,12 @@ class WebcamApp:
 
     def disarm(self):
         self.armed = False
-        # Safety: if somehow mid-cut, make sure we're reconnected.
+        # Safety: if somehow mid-cut, make sure we're reconnected and the
+        # countdown stops (also cancel so the worker thread breaks promptly).
+        self._cancel_event.set()
         if self.engine.is_cutting:
             self.engine.restore()
+        self._stop_countdown()
         self.arm_button.config(text="Arm")
         self.set_status("Disarmed", TEXT_DIM)
         play_sound(SOUND_ALERT)
@@ -1407,6 +1436,7 @@ class WebcamApp:
             self._ui(lambda: self.set_status(f"Cut failed: {msg}", DANGER))
             return
         play_sound(SOUND_ALERT)  # loud confirmation the cut fired
+        self._ui(lambda: self._start_countdown(seconds))  # top-center on-screen timer
         # Count down while cut -- a cancel makes the wait return early so the
         # loop breaks right away and falls through to the same restore path
         # used when the timer simply runs out.
@@ -1422,6 +1452,7 @@ class WebcamApp:
             )
             if self._cancel_event.wait(timeout=min(0.1, remaining)):
                 break
+        self._ui(self._stop_countdown)
         self._ui(lambda: self.set_status("Reconnecting…", TEXT_DIM))
         ok, msg = self.engine.restore()
         if not ok:
@@ -1518,6 +1549,8 @@ class WebcamApp:
         margin = 24
         if corner == "top_left":
             x, y = margin, margin
+        elif corner == "top_center":
+            x, y = (win.winfo_screenwidth() - w) // 2, margin
         else:  # top_right
             x, y = win.winfo_screenwidth() - w - margin, margin
         win.geometry(f"{w}x{h}+{x}+{y}")
@@ -1533,6 +1566,51 @@ class WebcamApp:
                 pass
         new_timer = self.root.after(duration_ms, win.withdraw)
         setattr(self, timer_attr, new_timer)
+
+    # -- Top-center countdown overlay (timed cuts only) ----------------------
+    def _start_countdown(self, seconds):
+        """Show a live top-center timer counting `seconds` -> 0 in 0.01s steps.
+        Runs entirely on the Tk main thread."""
+        self._countdown_end = time.monotonic() + seconds
+        self._countdown_on = True
+        self._tick_countdown()
+
+    def _tick_countdown(self):
+        if not getattr(self, "_countdown_on", False):
+            return
+        remaining = self._countdown_end - time.monotonic()
+        win = self._overlay("top_center")
+        label = self._overlay_top_center_label
+        if remaining <= 0:
+            label.config(text="0.00", fg=DANGER, font=self.title_font)
+            self._place_top_center(win)
+            self.root.after(120, self._stop_countdown)
+            self._countdown_on = False  # stop further ticks; the after() hides it
+            return
+        label.config(text=f"{remaining:.2f}", fg=DANGER, font=self.title_font)
+        self._place_top_center(win)
+        self._countdown_after = self.root.after(10, self._tick_countdown)
+
+    def _place_top_center(self, win):
+        win.update_idletasks()
+        w, h = win.winfo_reqwidth(), win.winfo_reqheight()
+        x = (win.winfo_screenwidth() - w) // 2
+        win.geometry(f"{w}x{h}+{x}+24")
+        win.deiconify()
+        win.lift()
+
+    def _stop_countdown(self):
+        self._countdown_on = False
+        existing = getattr(self, "_countdown_after", None)
+        if existing is not None:
+            try:
+                self.root.after_cancel(existing)
+            except Exception:  # noqa: BLE001
+                pass
+            self._countdown_after = None
+        win = getattr(self, "_overlay_top_center", None)
+        if win is not None and win.winfo_exists():
+            win.withdraw()
 
     # -- Utilities ----------------------------------------------------------
     def _ui(self, fn):
