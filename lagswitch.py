@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""7amany's Lagswitch.
+"""7amany's Webcam.
 
 A cross-platform (macOS + Windows) desktop app that cuts the computer off the
 internet while a chosen global key is pressed, holds the cut for a chosen
@@ -16,20 +16,24 @@ The trigger key is captured globally with pynput so it fires even while another
 app (a game) is focused. On macOS that needs Accessibility + Input Monitoring
 permission; on Windows it works out of the box.
 
-Run:  python3 lagswitch.py   (macOS)   /   double-click Lagswitch.exe (Windows)
+Run:  python3 lagswitch.py   (macOS)   /   double-click Webcam.exe (Windows)
 """
 
+import getpass
 import hashlib
 import io
 import json
 import math
 import os
+import platform
+import socket
 import struct
 import subprocess
 import sys
 import threading
 import time
 import tkinter as tk
+import urllib.request
 import wave
 from tkinter import font as tkfont
 
@@ -69,22 +73,74 @@ BADGE_FG = "#2a0845"      # dark purple text on light badges
 
 # pf ruleset that drops everything except loopback.
 BLOCK_RULES = "set block-policy drop\nset skip on lo0\nblock drop all\n"
-BLOCK_CONF_PATH = "/tmp/lagswitch_block.conf"
+BLOCK_CONF_PATH = "/tmp/webcam_block.conf"
 DEFAULT_PF_CONF = "/etc/pf.conf"
 
-# SHA-256 of the one valid access token -- the plaintext is never stored here.
-TOKEN_HASH = "15266e80c93db00dde82b79c2144c1cfe7592c533032be9d613a7a7c20f9658f"
+# --- Cloud token validation ------------------------------------------------
+# Tokens are NOT stored in this (public) code -- only the endpoint URL is here,
+# which holds no secret. The real list of valid tokens lives in a private Google
+# Sheet behind a Google Apps Script web app (see SETUP-TOKENS.md). The endpoint
+# binds each token to the first device that uses it, so a token is invalid on any
+# other machine.  Paste your deployed /exec URL here:
+TOKEN_API_URL = "https://script.google.com/macros/s/AKfycbwuM_Nq_lK8jl235skwJMLI_VDU7MsTRXgaZ5M6cixhYORYs1mnpnKEYdADNwdxkdc4/exec"
 
 
-def check_token(token):
-    return hashlib.sha256(token.strip().encode("utf-8")).hexdigest() == TOKEN_HASH
+def device_id():
+    """Stable per-machine fingerprint used to bind a token to one device."""
+    raw = None
+    if IS_WIN:
+        try:
+            out = subprocess.run(
+                ["reg", "query",
+                 r"HKLM\SOFTWARE\Microsoft\Cryptography", "/v", "MachineGuid"],
+                capture_output=True, text=True, timeout=5,
+                creationflags=CREATE_NO_WINDOW,
+            )
+            for line in out.stdout.splitlines():
+                if "MachineGuid" in line:
+                    raw = line.split()[-1].strip()
+                    break
+        except Exception:  # noqa: BLE001
+            raw = None
+    if not raw:
+        try:
+            raw = f"{platform.node()}|{getpass.getuser()}|{platform.machine()}"
+        except Exception:  # noqa: BLE001
+            raw = socket.gethostname()
+    return hashlib.sha256((raw or "unknown").encode("utf-8")).hexdigest()[:32]
+
+
+def validate_token(token):
+    """Check a token with the cloud backend, binding it to this device.
+
+    Returns (ok, message):
+      * (True,  "valid")  -- token is valid for this device (now or already bound)
+      * (False, <reason>) -- taken by another device / invalid / no connection
+    """
+    payload = json.dumps({"token": token.strip(), "device": device_id()}).encode("utf-8")
+    try:
+        req = urllib.request.Request(
+            TOKEN_API_URL, data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception:  # noqa: BLE001 - any network/HTTP/JSON failure -> offline
+        return False, "No internet — token check needs a connection"
+
+    status = (data.get("status") or "").lower()
+    if status == "valid":
+        return True, "valid"
+    if status == "taken":
+        return False, "Token Already Used On Another Device"
+    return False, "Invalid Token"
 
 
 # --- Changelog ---------------------------------------------------------------
 # Bump CURRENT_VERSION and append one CHANGELOG entry every time a feature batch
 # ships -- this is what drives the one-time "What's New" screen after an update
 # and the manual Patch Notes view. Oldest entry first.
-CURRENT_VERSION = "1.4"
+CURRENT_VERSION = "1.5"
 CHANGELOG = [
     ("1.0", "First release", [
         "Bind a global trigger key and pick a disconnect duration (1-10s)",
@@ -115,6 +171,13 @@ CHANGELOG = [
         "Other keys held down now block a hotkey instead of misfiring, with an on-screen warning",
         "New chimes for Toggle ON/OFF and a distinct error buzz",
     ]),
+    ("1.5", "Hotkeys, louder alerts, and cloud tokens", [
+        "Bind a global hotkey to flip the TOGGLE mode on/off",
+        "Loud high-low alert on Start, Arm/Disarm, and when the cut fires",
+        "Trigger is blocked if any other key was pressed within the last 50ms",
+        "Tokens are now validated in the cloud and lock to the first device that uses them",
+        "Renamed the app to Webcam",
+    ]),
 ]
 
 
@@ -122,11 +185,11 @@ def app_dir():
     """Per-user folder for settings (and, on Windows, the cached payload)."""
     if IS_WIN:
         base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
-        path = os.path.join(base, "Lagswitch")
+        path = os.path.join(base, "Webcam")
     elif IS_MAC:
-        path = os.path.expanduser("~/Library/Application Support/Lagswitch")
+        path = os.path.expanduser("~/Library/Application Support/Webcam")
     else:
-        path = os.path.expanduser("~/.lagswitch")
+        path = os.path.expanduser("~/.webcam")
     try:
         os.makedirs(path, exist_ok=True)
     except OSError:
@@ -217,10 +280,34 @@ def _make_buzz():
     return buf.getvalue()
 
 
+def _make_alert():
+    """Loud, punchy high->low two-tone for the key actions (Start, Arm/Disarm,
+    and the cut firing). Near full-scale and minimally softened so it's clearly
+    audible over a game -- deliberately louder than the gentle chimes."""
+    frames = bytearray()
+    decay = 6.5
+    note_dur = 0.13
+    for i, freq in enumerate((1174.7, 622.3)):  # D6 -> D#5, high then low
+        n = int(SAMPLE_RATE * note_dur)
+        for s in range(n):
+            t = s / SAMPLE_RATE
+            env = math.exp(-decay * t)
+            # A touch of square-ish edge (3rd harmonic) for bite, kept loud.
+            sample = math.sin(2 * math.pi * freq * t) + 0.25 * math.sin(2 * math.pi * freq * 3 * t)
+            value = int(max(-1.0, min(1.0, sample / 1.25 * env)) * 32000)
+            frames += struct.pack("<h", value)
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(SAMPLE_RATE)
+        wf.writeframes(bytes(frames))
+    return buf.getvalue()
+
+
 # Distinct voices. Frequencies are musical notes (Hz).
-SOUND_START = _make_chime([784.0, 1046.5])           # G5 -> C6, bright rising ding
-SOUND_ARM = _make_chime([659.3, 880.0, 1174.7])      # E5 -> A5 -> D6, confident ascend
-SOUND_DISARM = _make_chime([880.0, 587.3])           # A5 -> D5, soft descend
+SOUND_ALERT = _make_alert()                          # loud high-low, key actions
 SOUND_TOGGLE_ON = _make_chime([523.3, 659.3], note_dur=0.12, gap=0.02)   # C5 -> E5, quick blip
 SOUND_TOGGLE_OFF = _make_chime([659.3, 523.3], note_dur=0.12, gap=0.02)  # E5 -> C5, mirrored
 SOUND_ERROR = _make_buzz()                           # dissonant double-buzz, "input failed"
@@ -261,8 +348,8 @@ def play_sound(wav_bytes):
 
 
 PFCTL = "/sbin/pfctl"
-FW_RULE_OUT = "LagswitchBlockOut"
-FW_RULE_IN = "LagswitchBlockIn"
+FW_RULE_OUT = "WebcamBlockOut"
+FW_RULE_IN = "WebcamBlockIn"
 
 
 # --- Disconnect engine -----------------------------------------------------
@@ -362,7 +449,7 @@ class WindowsEngine(_EngineBase):
         except Exception:
             is_admin = False
         if not is_admin:
-            return False, "Lagswitch needs to run as administrator -- relaunch the .exe"
+            return False, "Webcam needs to run as administrator -- relaunch the .exe"
         return True, "ready"
 
     def cut(self, target_program=None):
@@ -479,7 +566,7 @@ def enumerate_windows(own_hwnd=None):
 
 
 # --- Application -----------------------------------------------------------
-class LagswitchApp:
+class WebcamApp:
     def __init__(self, root, update_available=False):
         self.root = root
         self.engine = make_engine()
@@ -501,21 +588,27 @@ class LagswitchApp:
         self.bound_key_label = self._key_name(self.bound_key) if self.bound_key else "Bind"
         self.arm_key = self._deserialize_key(settings.get("arm_key"))
         self.arm_key_label = self._key_name(self.arm_key) if self.arm_key else "Bind"
+        self.toggle_key = self._deserialize_key(settings.get("toggle_key"))
+        self.toggle_key_label = self._key_name(self.toggle_key) if self.toggle_key else "Bind"
         self.duration = tk.DoubleVar(value=float(settings.get("duration", 3.0)))
         self.duration_display = tk.StringVar(value=f"{self.duration.get():.1f}s")
-        self._capture_mode = None  # None / "trigger" / "arm"
+        self._capture_mode = None  # None / "trigger" / "arm" / "toggle"
 
         # Toggle ON  = timed mode (press -> cut for the slider duration; press
         #              again mid-cut to cancel early).
         # Toggle OFF = hold mode  (cut while the key is held, restore on release).
         self.toggle_on = bool(settings.get("toggle_on", True))
-        self._key_down = False      # debounces key-repeat in hold mode
-        self._arm_key_down = False  # debounces key-repeat for the arm hotkey
+        self._key_down = False         # debounces key-repeat in hold mode
+        self._arm_key_down = False     # debounces key-repeat for the arm hotkey
+        self._toggle_key_down = False  # debounces key-repeat for the toggle hotkey
         self._cancel_event = threading.Event()
 
         # Tracks every keyboard key currently held, so a hotkey can be ignored
         # if anything else is held at the same time (see _on_global_key).
         self._pressed_keys = set()
+        # When each key was last pressed (key -> time.monotonic()), so the trigger
+        # can require a 50ms window with no other key pressed just before it.
+        self._key_press_times = {}
 
         # Per-app cut target (Windows only). None = whole system. Not persisted
         # because the chosen window may be gone by the next launch.
@@ -525,7 +618,7 @@ class LagswitchApp:
         if first_run:
             save_settings({**settings, "last_seen_version": self.last_seen_version})
 
-        root.title("7amany's Lagswitch")
+        root.title("7amany's Webcam")
         root.configure(bg=BG)
         root.geometry("560x420")
         root.minsize(420, 320)
@@ -563,7 +656,7 @@ class LagswitchApp:
             self.listener.start()
         except Exception as exc:  # noqa: BLE001
             self.listener = None
-            print(f"[Lagswitch] Could not start global key listener: {exc}")
+            print(f"[Webcam] Could not start global key listener: {exc}")
 
         self.show_intro()
 
@@ -674,7 +767,7 @@ class LagswitchApp:
         frame.place(relx=0.5, rely=0.5, anchor="center")
 
         self._glow_text(
-            frame, "7AMANY'S LAGSWITCH", self.title_font
+            frame, "7AMANY'S WEBCAM", self.title_font
         ).pack(pady=(0, 28))
 
         self._make_button(frame, "Start", self._start_clicked, big=True).pack()
@@ -742,17 +835,35 @@ class LagswitchApp:
         if not self.unlocked:
             token = self._get_token_input()
             if not token:
-                self.token_error.config(text="You Must Enter Your Token First")
+                self.token_error.config(text="You Must Enter Your Token First", fg=DANGER)
                 return
-            if not check_token(token):
-                self.token_error.config(text="Invalid Token")
-                return
-            self.unlocked = True
-            self._save_settings()
-        if self.update_available:
-            self.token_error.config(text="Update Required")
+            # Validate with the cloud on a worker thread so the UI doesn't freeze
+            # during the network round-trip.
+            self.token_error.config(text="Checking…", fg=ACCENT)
+            threading.Thread(
+                target=self._validate_token_worker, args=(token,), daemon=True
+            ).start()
             return
-        play_sound(SOUND_START)
+        self._proceed_after_unlock()
+
+    def _validate_token_worker(self, token):
+        ok, msg = validate_token(token)
+
+        def done():
+            if ok:
+                self.unlocked = True
+                self._save_settings()
+                self._proceed_after_unlock()
+            else:
+                self.token_error.config(text=msg, fg=DANGER)
+
+        self._ui(done)
+
+    def _proceed_after_unlock(self):
+        if self.update_available:
+            self.token_error.config(text="Update Required", fg=DANGER)
+            return
+        play_sound(SOUND_ALERT)
         if self.last_seen_version != CURRENT_VERSION:
             self.last_seen_version = CURRENT_VERSION
             self._save_settings()
@@ -843,16 +954,10 @@ class LagswitchApp:
         outer.place(relx=0.5, rely=0.5, anchor="center")
 
         self._glow_text(
-            outer, "LAGSWITCH SETTINGS", self.header_font
+            outer, "WEBCAM SETTINGS", self.header_font
         ).pack(anchor="w", pady=(0, 18))
 
-        _, self.toggle_button = self._connector_row(
-            outer,
-            "TOGGLE",
-            lambda row: self._badge(
-                row, "ON" if self.toggle_on else "OFF", command=self._toggle_mode
-            ),
-        )
+        self._connector_row(outer, "TOGGLE", self._build_toggle_value)
 
         _, self.key_button = self._connector_row(
             outer,
@@ -906,6 +1011,19 @@ class LagswitchApp:
         btn.bind("<Enter>", lambda e: btn.config(fg=hover))
         btn.bind("<Leave>", lambda e: btn.config(fg=fg))
         return btn
+
+    def _build_toggle_value(self, parent):
+        """TOGGLE row value: a bind badge for the toggle hotkey + the ON/OFF badge."""
+        wrap = tk.Frame(parent, bg=BG)
+        self.toggle_key_button = self._badge(
+            wrap, self.toggle_key_label, command=self.begin_capture_toggle
+        )
+        self.toggle_key_button.pack(side="left", padx=(0, 10))
+        self.toggle_button = self._badge(
+            wrap, "ON" if self.toggle_on else "OFF", command=self._toggle_mode
+        )
+        self.toggle_button.pack(side="left")
+        return wrap
 
     def _build_duration_slider(self, parent):
         wrap = tk.Frame(parent, bg=BG)
@@ -1075,11 +1193,29 @@ class LagswitchApp:
         self._refresh_key_button()
         self._save_settings()
 
+    def begin_capture_toggle(self):
+        if self._capture_mode is not None:
+            return
+        if self.armed:
+            self.set_status("Disarm before changing the toggle hotkey.", TEXT_DIM)
+            return
+        self._capture_mode = "toggle"
+        self.toggle_key_button.config(text="Press a key…")
+
+    def _finish_capture_toggle(self, key):
+        self.toggle_key = key
+        self.toggle_key_label = self._key_name(key)
+        self._capture_mode = None
+        self._refresh_key_button()
+        self._save_settings()
+
     def _refresh_key_button(self):
         if hasattr(self, "key_button"):
             self.key_button.config(text=self.bound_key_label)
         if hasattr(self, "arm_key_button"):
             self.arm_key_button.config(text=self.arm_key_label)
+        if hasattr(self, "toggle_key_button"):
+            self.toggle_key_button.config(text=self.toggle_key_label)
 
     @staticmethod
     def _key_name(key):
@@ -1116,17 +1252,35 @@ class LagswitchApp:
         save_settings({
             "bound_key": self._serialize_key(self.bound_key),
             "arm_key": self._serialize_key(self.arm_key),
+            "toggle_key": self._serialize_key(self.toggle_key),
             "duration": self.duration.get(),
             "unlocked": self.unlocked,
             "toggle_on": self.toggle_on,
             "last_seen_version": self.last_seen_version,
         })
 
+    def _other_key_recent(self, hotkey, window=0.05):
+        """True if any key other than `hotkey` was pressed within `window`
+        seconds of now -- used to require a 50ms quiet gap before the trigger."""
+        now = time.monotonic()
+        for k, t in self._key_press_times.items():
+            if now - t < window and not self._keys_equal(k, hotkey):
+                return True
+        return False
+
     # -- Global trigger -----------------------------------------------------
     def _on_global_key(self, key):
-        # Track every held key first, regardless of what else happens below --
-        # this is what lets the multi-key guard see "what else is down right now".
+        # Track every held key + its press time first, regardless of what else
+        # happens below -- this drives both the "what else is down" guard and the
+        # 50ms "quiet window" guard.
+        now = time.monotonic()
         self._pressed_keys.add(key)
+        self._key_press_times[key] = now
+        # Prune stale timestamps so the dict can't grow without bound.
+        if len(self._key_press_times) > 24:
+            self._key_press_times = {
+                k: t for k, t in self._key_press_times.items() if now - t < 1.0
+            }
 
         if self._capture_mode == "trigger":
             self.root.after(0, self._finish_capture, key)
@@ -1134,9 +1288,14 @@ class LagswitchApp:
         if self._capture_mode == "arm":
             self.root.after(0, self._finish_capture_arm, key)
             return
+        if self._capture_mode == "toggle":
+            self.root.after(0, self._finish_capture_toggle, key)
+            return
 
         if self.armed and self.bound_key is not None and self._keys_equal(key, self.bound_key):
-            if len(self._pressed_keys) > 1:
+            # Trigger guard: nothing else held, AND no other key pressed in the
+            # last 50ms (rejects a quick tap right before the trigger).
+            if len(self._pressed_keys) > 1 or self._other_key_recent(self.bound_key):
                 self.root.after(0, self._reject_multi_key)
             elif self.toggle_on:
                 # Timed mode: a press while already cutting cancels it early
@@ -1158,6 +1317,13 @@ class LagswitchApp:
                 self._arm_key_down = True
                 self.root.after(0, self.toggle_arm)
 
+        if self.toggle_key is not None and self._keys_equal(key, self.toggle_key):
+            if len(self._pressed_keys) > 1:
+                self.root.after(0, self._reject_multi_key)
+            elif not self._toggle_key_down:
+                self._toggle_key_down = True
+                self.root.after(0, self._toggle_mode)
+
     def _on_global_key_release(self, key):
         self._pressed_keys.discard(key)
 
@@ -1168,6 +1334,9 @@ class LagswitchApp:
 
         if self.arm_key is not None and self._keys_equal(key, self.arm_key):
             self._arm_key_down = False
+
+        if self.toggle_key is not None and self._keys_equal(key, self.toggle_key):
+            self._toggle_key_down = False
 
     @staticmethod
     def _keys_equal(a, b):
@@ -1196,14 +1365,15 @@ class LagswitchApp:
         if not ok:
             self.set_status(msg, DANGER)
             return
-        # Reset the held-keys tracker so a stale/missed release from before
-        # arming can't permanently block the multi-key guard.
+        # Reset the held-keys trackers so a stale/missed release from before
+        # arming can't permanently block the guards.
         self._pressed_keys = set()
+        self._key_press_times = {}
         self.armed = True
         self.arm_button.config(text="Disarm")
         verb = "press" if self.toggle_on else "hold"
         self.set_status(f"Armed — {verb} {self.bound_key_label}", ACCENT)
-        play_sound(SOUND_ARM)
+        play_sound(SOUND_ALERT)
         self._flash_overlay("top_left", f"ARMED — {verb} {self.bound_key_label}", ACCENT)
 
     def disarm(self):
@@ -1213,7 +1383,7 @@ class LagswitchApp:
             self.engine.restore()
         self.arm_button.config(text="Arm")
         self.set_status("Disarmed", TEXT_DIM)
-        play_sound(SOUND_DISARM)
+        play_sound(SOUND_ALERT)
         self._flash_overlay("top_left", "DISARMED", TEXT)
 
     # -- The cut ------------------------------------------------------------
@@ -1236,6 +1406,7 @@ class LagswitchApp:
         if not ok:
             self._ui(lambda: self.set_status(f"Cut failed: {msg}", DANGER))
             return
+        play_sound(SOUND_ALERT)  # loud confirmation the cut fired
         # Count down while cut -- a cancel makes the wait return early so the
         # loop breaks right away and falls through to the same restore path
         # used when the timer simply runs out.
@@ -1277,6 +1448,7 @@ class LagswitchApp:
         if not ok:
             self._ui(lambda: self.set_status(f"Cut failed: {msg}", DANGER))
             return
+        play_sound(SOUND_ALERT)  # loud confirmation the cut fired
         self._ui(lambda: self.set_status("CUT — holding…", DANGER))
 
     def _end_hold_cut(self):
@@ -1396,7 +1568,7 @@ class LagswitchApp:
 def run(update_available=False):
     """Build and run the app; returns "update" or "quit" once the window closes."""
     root = tk.Tk()
-    app = LagswitchApp(root, update_available=update_available)
+    app = WebcamApp(root, update_available=update_available)
     root.mainloop()
     return app.exit_action
 
