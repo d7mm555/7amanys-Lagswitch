@@ -76,6 +76,10 @@ BLOCK_RULES = "set block-policy drop\nset skip on lo0\nblock drop all\n"
 BLOCK_CONF_PATH = "/tmp/webcam_block.conf"
 DEFAULT_PF_CONF = "/etc/pf.conf"
 
+# In "both" mode, a press released within this many seconds counts as a tap
+# (timed cut); anything longer is treated as a deliberate hold.
+BOTH_TAP_MAX = 0.25
+
 # --- Cloud token validation ------------------------------------------------
 # Tokens are NOT stored in this (public) code -- only the endpoint URL is here,
 # which holds no secret. The real list of valid tokens lives in a private Google
@@ -140,7 +144,7 @@ def validate_token(token):
 # Bump CURRENT_VERSION and append one CHANGELOG entry every time a feature batch
 # ships -- this is what drives the one-time "What's New" screen after an update
 # and the manual Patch Notes view. Oldest entry first.
-CURRENT_VERSION = "1.6"
+CURRENT_VERSION = "1.7"
 CHANGELOG = [
     ("1.0", "First release", [
         "Bind a global trigger key and pick a disconnect duration (1-10s)",
@@ -182,6 +186,13 @@ CHANGELOG = [
         "Fixed no sound playing on Windows",
         "Fixed the 'Input Failed' warning getting stuck until you disarmed/re-armed",
         "Added an on-screen countdown timer (top-center) while a timed cut is active",
+    ]),
+    ("1.7", "Three modes + always-on disconnect box", [
+        "Replaced the TOGGLE switch with a MODE selector: Toggle, Hold, or Both",
+        "Toggle = timed cut; Hold = cut only while the key is held; Both = tap for a timed cut, hold to cut while held",
+        "New Hold slider: infinite, or cap the hold at 0.1-12s (auto-reconnect even if you're still holding)",
+        "A 'Disconnected' box now shows top-left the whole time you're cut, in every mode",
+        "The disconnect sound now fires the instant you press the key, with no delay",
     ]),
 ]
 
@@ -598,20 +609,35 @@ class WebcamApp:
         self.bound_key_label = self._key_name(self.bound_key) if self.bound_key else "Bind"
         self.arm_key = self._deserialize_key(settings.get("arm_key"))
         self.arm_key_label = self._key_name(self.arm_key) if self.arm_key else "Bind"
-        self.toggle_key = self._deserialize_key(settings.get("toggle_key"))
-        self.toggle_key_label = self._key_name(self.toggle_key) if self.toggle_key else "Bind"
         self.duration = tk.DoubleVar(value=float(settings.get("duration", 3.0)))
         self.duration_display = tk.StringVar(value=f"{self.duration.get():.1f}s")
-        self._capture_mode = None  # None / "trigger" / "arm" / "toggle"
+        # Hold-mode auto-reconnect cap: 0 = infinite (cut until the key is
+        # released); otherwise 0.1-12s (reconnect at the cap even if still held).
+        self.hold_limit = tk.DoubleVar(value=float(settings.get("hold_limit", 0.0)))
+        self._capture_mode = None  # None / "trigger" / "arm"
 
-        # Toggle ON  = timed mode (press -> cut for the slider duration; press
-        #              again mid-cut to cancel early).
-        # Toggle OFF = hold mode  (cut while the key is held, restore on release).
-        self.toggle_on = bool(settings.get("toggle_on", True))
-        self._key_down = False         # debounces key-repeat in hold mode
+        # Three trigger modes, chosen with the MODE selector on the settings screen:
+        #   "toggle" -> timed cut (press -> cut for the DISCONNECT FOR duration;
+        #               press again mid-cut to cancel early).
+        #   "hold"   -> cut only while the key is held (capped by HOLD FOR).
+        #   "both"   -> a quick tap behaves like "toggle", a real hold like "hold".
+        mode = settings.get("mode")
+        if mode not in ("toggle", "hold", "both"):
+            # Migrate the old ON/OFF flag: ON was timed (toggle), OFF was hold.
+            mode = "toggle" if settings.get("toggle_on", True) else "hold"
+        self.mode = mode
+        self._key_down = False         # debounces key-repeat in hold/both mode
         self._arm_key_down = False     # debounces key-repeat for the arm hotkey
-        self._toggle_key_down = False  # debounces key-repeat for the toggle hotkey
         self._cancel_event = threading.Event()
+
+        # Live cut bookkeeping, read by the single cut worker (_run_cut):
+        self._active_mode = None       # None / "timed" / "hold" -- what's cutting now
+        self._reconnect_at = None      # monotonic deadline, or None = hold until released
+        self._both_pending = False     # "both": a press awaiting tap-vs-hold resolution
+        self._both_press_time = 0.0
+        # Bumped on every new cut so a superseded worker's trailing cleanup can't
+        # tear down the overlays a newer cut now owns (rapid successive cuts).
+        self._cut_gen = 0
 
         # When each key was last pressed (stable key id -> time.monotonic()), so a
         # hotkey can require a ~50ms window with no other key pressed just before it.
@@ -630,8 +656,8 @@ class WebcamApp:
 
         root.title("7amany's Webcam")
         root.configure(bg=BG)
-        root.geometry("560x420")
-        root.minsize(420, 320)
+        root.geometry("600x620")
+        root.minsize(540, 520)
         root.resizable(True, True)
         root.protocol("WM_DELETE_WINDOW", self.on_close)
 
@@ -752,7 +778,7 @@ class WebcamApp:
     def _connector_row(self, parent, label_text, value_factory):
         """value_factory(row) builds and returns the right-hand widget,
         since it must be parented to this row, not the caller's frame."""
-        row = tk.Frame(parent, bg=BG, width=440, height=56)
+        row = tk.Frame(parent, bg=BG, width=500, height=56)
         row.pack_propagate(False)
         row.pack(fill="x", pady=10)
         row.grid_columnconfigure(1, weight=1)
@@ -967,7 +993,7 @@ class WebcamApp:
             outer, "WEBCAM SETTINGS", self.header_font
         ).pack(anchor="w", pady=(0, 18))
 
-        self._connector_row(outer, "TOGGLE", self._build_toggle_value)
+        self._connector_row(outer, "MODE", self._build_mode_value)
 
         _, self.key_button = self._connector_row(
             outer,
@@ -976,6 +1002,7 @@ class WebcamApp:
         )
 
         self._connector_row(outer, "DISCONNECT FOR", self._build_duration_slider)
+        self._connector_row(outer, "HOLD FOR", self._build_hold_slider)
 
         if IS_WIN:
             _, self.target_button = self._connector_row(
@@ -1022,18 +1049,28 @@ class WebcamApp:
         btn.bind("<Leave>", lambda e: btn.config(fg=fg))
         return btn
 
-    def _build_toggle_value(self, parent):
-        """TOGGLE row value: a bind badge for the toggle hotkey + the ON/OFF badge."""
+    def _build_mode_value(self, parent):
+        """MODE row value: a three-way Toggle / Hold / Both segmented selector."""
         wrap = tk.Frame(parent, bg=BG)
-        self.toggle_key_button = self._badge(
-            wrap, self.toggle_key_label, command=self.begin_capture_toggle
-        )
-        self.toggle_key_button.pack(side="left", padx=(0, 10))
-        self.toggle_button = self._badge(
-            wrap, "ON" if self.toggle_on else "OFF", command=self._toggle_mode
-        )
-        self.toggle_button.pack(side="left")
+        self.mode_buttons = {}
+        for m, label in (("toggle", "Toggle"), ("hold", "Hold"), ("both", "Both")):
+            btn = self._badge(wrap, label, command=lambda mm=m: self._set_mode(mm))
+            btn.pack(side="left", padx=(0, 6))
+            self.mode_buttons[m] = btn
+        self._refresh_mode_buttons()
         return wrap
+
+    def _refresh_mode_buttons(self):
+        """Highlight the selected mode badge; dim the other two."""
+        if not hasattr(self, "mode_buttons"):
+            return
+        for m, btn in self.mode_buttons.items():
+            if m == self.mode:
+                btn.config(bg=ACCENT, fg="white",
+                           activebackground=ACCENT_HI, activeforeground="white")
+            else:
+                btn.config(bg=BADGE_BG, fg=BADGE_FG,
+                           activebackground=ACCENT_HI, activeforeground="white")
 
     def _build_duration_slider(self, parent):
         wrap = tk.Frame(parent, bg=BG)
@@ -1076,30 +1113,88 @@ class WebcamApp:
         self._apply_slider_state()
         return wrap
 
-    def _apply_slider_state(self):
-        """In hold mode the slider is unused, so grey it out."""
-        if not hasattr(self, "duration_slider"):
-            return
-        if self.toggle_on:
-            self.duration_slider.config(state="normal", fg=ACCENT, troughcolor=PANEL)
-            self.duration_value_badge.config(fg=BADGE_FG)
-        else:
-            self.duration_slider.config(state="disabled", fg=TEXT_DIM, troughcolor=BG)
-            self.duration_value_badge.config(fg=TEXT_DIM)
+    def _hold_display(self):
+        v = round(self.hold_limit.get(), 1)
+        return "∞" if v <= 0 else f"{v:.1f}s"
 
-    # -- Toggle: timed (ON) vs hold (OFF) -----------------------------------
-    def _toggle_mode(self):
+    def _build_hold_slider(self, parent):
+        """Hold-mode cap slider: leftmost (0) shows ∞ = hold until release,
+        otherwise 0.1-12s to auto-reconnect at the cap even while still held."""
+        wrap = tk.Frame(parent, bg=BG)
+
+        value_badge = self._make_label(wrap, self._hold_display(), self.body_font, BADGE_FG, BADGE_BG)
+        value_badge.config(width=5, highlightthickness=2, highlightbackground=ACCENT)
+        value_badge.pack(side="right", padx=(10, 0))
+
+        def on_move(_value):
+            value_badge.config(text=self._hold_display())
+
+        def on_release(_event):
+            self._save_settings()
+
+        slider = tk.Scale(
+            wrap,
+            from_=0.0,
+            to=12.0,
+            resolution=0.1,
+            orient="horizontal",
+            variable=self.hold_limit,
+            command=on_move,
+            length=180,
+            showvalue=False,
+            bg=BG,
+            fg=ACCENT,
+            troughcolor=PANEL,
+            activebackground=ACCENT_HI,
+            highlightthickness=0,
+            bd=0,
+            sliderrelief="flat",
+            takefocus=0,
+        )
+        slider.bind("<ButtonRelease-1>", on_release)
+        slider.pack(side="left")
+        self.hold_slider = slider
+        self.hold_value_badge = value_badge
+        self._apply_slider_state()
+        return wrap
+
+    def _apply_slider_state(self):
+        """Grey out whichever slider the current mode doesn't use.
+        DISCONNECT FOR drives Toggle (and a Both tap); HOLD FOR drives Hold
+        (and a Both hold); Both uses both sliders."""
+        timed = self.mode in ("toggle", "both")
+        hold = self.mode in ("hold", "both")
+        if hasattr(self, "duration_slider"):
+            if timed:
+                self.duration_slider.config(state="normal", fg=ACCENT, troughcolor=PANEL)
+                self.duration_value_badge.config(fg=BADGE_FG)
+            else:
+                self.duration_slider.config(state="disabled", fg=TEXT_DIM, troughcolor=BG)
+                self.duration_value_badge.config(fg=TEXT_DIM)
+        if hasattr(self, "hold_slider"):
+            if hold:
+                self.hold_slider.config(state="normal", fg=ACCENT, troughcolor=PANEL)
+                self.hold_value_badge.config(fg=BADGE_FG)
+            else:
+                self.hold_slider.config(state="disabled", fg=TEXT_DIM, troughcolor=BG)
+                self.hold_value_badge.config(fg=TEXT_DIM)
+
+    # -- Mode: toggle / hold / both -----------------------------------------
+    def _mode_verb(self):
+        return {"toggle": "press", "hold": "hold", "both": "tap/hold"}.get(self.mode, "press")
+
+    def _set_mode(self, mode):
         if self.armed:
             self.set_status("Disarm before switching mode.", TEXT_DIM)
             return
-        self.toggle_on = not self.toggle_on
-        self.toggle_button.config(text="ON" if self.toggle_on else "OFF")
+        if mode == self.mode:
+            return
+        self.mode = mode
+        self._refresh_mode_buttons()
         self._apply_slider_state()
         self._save_settings()
-        play_sound(SOUND_TOGGLE_ON if self.toggle_on else SOUND_TOGGLE_OFF)
-        self._flash_overlay(
-            "top_left", f"TOGGLE {'ON' if self.toggle_on else 'OFF'}", ACCENT
-        )
+        play_sound(SOUND_TOGGLE_ON)
+        self._flash_overlay("top_left", f"MODE — {mode.upper()}", ACCENT)
 
     # -- Select Window: per-app cut target (Windows only) -------------------
     def _target_display(self):
@@ -1203,29 +1298,11 @@ class WebcamApp:
         self._refresh_key_button()
         self._save_settings()
 
-    def begin_capture_toggle(self):
-        if self._capture_mode is not None:
-            return
-        if self.armed:
-            self.set_status("Disarm before changing the toggle hotkey.", TEXT_DIM)
-            return
-        self._capture_mode = "toggle"
-        self.toggle_key_button.config(text="Press a key…")
-
-    def _finish_capture_toggle(self, key):
-        self.toggle_key = key
-        self.toggle_key_label = self._key_name(key)
-        self._capture_mode = None
-        self._refresh_key_button()
-        self._save_settings()
-
     def _refresh_key_button(self):
         if hasattr(self, "key_button"):
             self.key_button.config(text=self.bound_key_label)
         if hasattr(self, "arm_key_button"):
             self.arm_key_button.config(text=self.arm_key_label)
-        if hasattr(self, "toggle_key_button"):
-            self.toggle_key_button.config(text=self.toggle_key_label)
 
     @staticmethod
     def _key_name(key):
@@ -1262,10 +1339,10 @@ class WebcamApp:
         save_settings({
             "bound_key": self._serialize_key(self.bound_key),
             "arm_key": self._serialize_key(self.arm_key),
-            "toggle_key": self._serialize_key(self.toggle_key),
             "duration": self.duration.get(),
+            "hold_limit": self.hold_limit.get(),
             "unlocked": self.unlocked,
-            "toggle_on": self.toggle_on,
+            "mode": self.mode,
             "last_seen_version": self.last_seen_version,
         })
 
@@ -1312,9 +1389,6 @@ class WebcamApp:
         if self._capture_mode == "arm":
             self.root.after(0, self._finish_capture_arm, key)
             return
-        if self._capture_mode == "toggle":
-            self.root.after(0, self._finish_capture_toggle, key)
-            return
 
         if self.armed and self.bound_key is not None and self._keys_equal(key, self.bound_key):
             # Trigger guard: reject if any *other* key was pressed in the last 50ms
@@ -1322,17 +1396,29 @@ class WebcamApp:
             # right before the trigger). Time-pruned, so it can never stick.
             if self._other_key_recent(self.bound_key):
                 self.root.after(0, self._reject_multi_key)
-            elif self.toggle_on:
-                # Timed mode: a press while already cutting cancels it early
-                # instead of being ignored.
+            elif self.mode == "toggle":
+                # Timed: a press while already cutting cancels it early.
                 if self.engine.is_cutting:
                     self.root.after(0, self.cancel_cut)
                 else:
+                    play_sound(SOUND_ALERT)  # immediate: fired off the listener thread
                     self.root.after(0, self.trigger_cut)
-            else:
-                # Hold mode: cut on the first press, ignore key-repeat until release.
+            elif self.mode == "hold":
+                # Cut on the first press, ignore key-repeat until release.
                 if not self._key_down:
                     self._key_down = True
+                    play_sound(SOUND_ALERT)  # immediate
+                    self.root.after(0, self._start_hold_cut)
+            else:  # both
+                # A running timed cut (from a prior tap) is cancelled by a press.
+                if self.engine.is_cutting and self._active_mode == "timed":
+                    self.root.after(0, self.cancel_cut)
+                elif not self._key_down:
+                    # Start as a hold now; the release decides tap-vs-hold.
+                    self._key_down = True
+                    self._both_pending = True
+                    self._both_press_time = now
+                    play_sound(SOUND_ALERT)  # immediate
                     self.root.after(0, self._start_hold_cut)
 
         if self.arm_key is not None and self._keys_equal(key, self.arm_key):
@@ -1342,28 +1428,26 @@ class WebcamApp:
                 self._arm_key_down = True
                 self.root.after(0, self.toggle_arm)
 
-        if self.toggle_key is not None and self._keys_equal(key, self.toggle_key):
-            if self._other_key_recent(self.toggle_key):
-                self.root.after(0, self._reject_multi_key)
-            elif not self._toggle_key_down:
-                self._toggle_key_down = True
-                self.root.after(0, self._toggle_mode)
-
     def _on_global_key_release(self, key):
         # Match by stable id so a release object that differs from the press
         # object still clears the debounce flag (else hold mode could stick on).
         rid = self._key_id(key)
 
-        if not self.toggle_on and self.bound_key is not None:
-            if rid == self._key_id(self.bound_key):
-                self._key_down = False
-                self.root.after(0, self._end_hold_cut)
+        if self.bound_key is not None and rid == self._key_id(self.bound_key):
+            was_down = self._key_down
+            self._key_down = False  # always clear, even if the cap already fired
+            if self.mode == "hold":
+                if was_down:
+                    self.root.after(0, self._release_hold)
+            elif self.mode == "both":
+                pending = self._both_pending
+                self._both_pending = False
+                if was_down:
+                    self.root.after(0, lambda p=pending: self._release_both(p))
+            # "toggle" mode ignores releases (the timer or a second press ends it).
 
         if self.arm_key is not None and rid == self._key_id(self.arm_key):
             self._arm_key_down = False
-
-        if self.toggle_key is not None and rid == self._key_id(self.toggle_key):
-            self._toggle_key_down = False
 
     @staticmethod
     def _keys_equal(a, b):
@@ -1393,11 +1477,14 @@ class WebcamApp:
             self.set_status(msg, DANGER)
             return
         # Clear recent-press history so a tap right before arming can't block
-        # the very first trigger.
+        # the very first trigger, and reset any stale cut bookkeeping.
         self._key_press_times = {}
+        self._key_down = False
+        self._both_pending = False
+        self._active_mode = None
         self.armed = True
         self.arm_button.config(text="Disarm")
-        verb = "press" if self.toggle_on else "hold"
+        verb = self._mode_verb()
         self.set_status(f"Armed — {verb} {self.bound_key_label}", ACCENT)
         play_sound(SOUND_ALERT)
         self._flash_overlay("top_left", f"ARMED — {verb} {self.bound_key_label}", ACCENT)
@@ -1405,102 +1492,124 @@ class WebcamApp:
     def disarm(self):
         self.armed = False
         # Safety: if somehow mid-cut, make sure we're reconnected and the
-        # countdown stops (also cancel so the worker thread breaks promptly).
+        # overlays stop (also cancel so the worker thread breaks promptly).
         self._cancel_event.set()
         if self.engine.is_cutting:
             self.engine.restore()
         self._stop_countdown()
+        self._hide_disconnected()
+        self._active_mode = None
+        self._key_down = False
+        self._both_pending = False
         self.arm_button.config(text="Arm")
         self.set_status("Disarmed", TEXT_DIM)
         play_sound(SOUND_ALERT)
         self._flash_overlay("top_left", "DISARMED", TEXT)
 
     # -- The cut ------------------------------------------------------------
+    # One worker (_run_cut) drives every cut. It reads self._reconnect_at each
+    # iteration -- a monotonic deadline, or None to stay cut until released --
+    # so a "both"-mode release can convert a hold into a timed cut on the fly,
+    # and self._cancel_event lets any release / second press / disarm end it now.
     def trigger_cut(self):
+        """Start a timed cut (Toggle press)."""
         if self.engine.is_cutting or not self.armed:
             return
+        self._active_mode = "timed"
+        self._reconnect_at = time.monotonic() + self.duration.get()
         self._cancel_event.clear()
-        seconds = self.duration.get()
-        worker = threading.Thread(
-            target=self._cut_worker, args=(seconds,), daemon=True
-        )
-        worker.start()
+        self._cut_gen += 1
+        threading.Thread(target=self._run_cut, args=(self._cut_gen,), daemon=True).start()
+
+    def _start_hold_cut(self):
+        """Start a hold cut (Hold press, or the opening of a Both press).
+        Capped by HOLD FOR; an infinite cap (0) holds until the key is released."""
+        if self.engine.is_cutting or not self.armed:
+            return
+        self._active_mode = "hold"
+        limit = self.hold_limit.get()
+        self._reconnect_at = (time.monotonic() + limit) if limit > 0 else None
+        self._cancel_event.clear()
+        self._cut_gen += 1
+        threading.Thread(target=self._run_cut, args=(self._cut_gen,), daemon=True).start()
 
     def cancel_cut(self):
         if self.engine.is_cutting:
             self._cancel_event.set()
 
-    def _cut_worker(self, seconds):
+    def _release_hold(self):
+        """Hold mode: releasing the key reconnects (unless the cap already did)."""
+        if self.engine.is_cutting and self._active_mode == "hold":
+            self._cancel_event.set()
+
+    def _release_both(self, pending):
+        """Both mode: on release, decide whether the press was a tap or a hold."""
+        if not pending:
+            return
+        if not (self.engine.is_cutting and self._active_mode == "hold"):
+            return  # the cap already fired, or nothing is cutting
+        held = time.monotonic() - self._both_press_time
+        if held <= BOTH_TAP_MAX:
+            # Tap -> behave like Toggle: keep cutting for the DISCONNECT FOR
+            # window measured from the original press, then auto-reconnect.
+            self._active_mode = "timed"
+            deadline = self._both_press_time + self.duration.get()
+            if deadline <= time.monotonic():
+                self._cancel_event.set()  # window already elapsed; reconnect now
+            else:
+                self._reconnect_at = deadline
+                self._ui(self._start_countdown)  # show the timer for the new deadline
+        else:
+            self._cancel_event.set()  # genuine hold released -> reconnect now
+
+    def _run_cut(self, gen):
         ok, msg = self.engine.cut(self.target_program)
         if not ok:
+            if gen == self._cut_gen:
+                self._active_mode = None
             self._ui(lambda: self.set_status(f"Cut failed: {msg}", DANGER))
             return
-        play_sound(SOUND_ALERT)  # loud confirmation the cut fired
-        self._ui(lambda: self._start_countdown(seconds))  # top-center on-screen timer
-        # Count down while cut -- a cancel makes the wait return early so the
-        # loop breaks right away and falls through to the same restore path
-        # used when the timer simply runs out.
-        end = time.monotonic() + seconds
+        # Persistent top-left "Disconnected" box for the whole cut, every mode.
+        self._ui(self._show_disconnected)
+        if self._reconnect_at is not None:
+            self._ui(self._start_countdown)  # top-center timer when there's a deadline
         while True:
-            remaining = end - time.monotonic()
-            if remaining <= 0:
+            if self._cancel_event.is_set():
                 break
-            self._ui(
-                lambda r=remaining: self.set_status(
-                    f"CUT — {max(r, 0):.1f}s left", DANGER
-                )
-            )
-            if self._cancel_event.wait(timeout=min(0.1, remaining)):
-                break
-        self._ui(self._stop_countdown)
-        self._ui(lambda: self.set_status("Reconnecting…", TEXT_DIM))
+            deadline = self._reconnect_at  # re-read live (a Both release can change it)
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._ui(lambda r=remaining: self.set_status(
+                    f"CUT — {max(r, 0):.1f}s left", DANGER))
+                if self._cancel_event.wait(timeout=min(0.05, max(0.005, remaining))):
+                    break
+            else:
+                self._ui(lambda: self.set_status("CUT — holding…", DANGER))
+                if self._cancel_event.wait(timeout=0.1):
+                    break
+        # Tear down overlays only if no newer cut superseded us (these callbacks
+        # re-check the generation when they actually run on the Tk thread, so a
+        # stale worker can't kill a fresh cut's countdown/box).
+        self._ui(lambda g=gen: g == self._cut_gen and self._stop_countdown())
+        self._ui(lambda g=gen: g == self._cut_gen and self._hide_disconnected())
+        self._ui(lambda g=gen: self.set_status("Reconnecting…", TEXT_DIM)
+                 if g == self._cut_gen else None)
         ok, msg = self.engine.restore()
-        if not ok:
-            self._ui(
-                lambda: self.set_status(
-                    f"Reconnect issue: {msg}", DANGER
-                )
-            )
-        else:
-            self._ui(
-                lambda: self.set_status(
-                    f"Armed — press {self.bound_key_label}", ACCENT
-                )
-            )
+        if gen == self._cut_gen:
+            self._active_mode = None
 
-    # -- Hold-mode cut (toggle OFF: cut while key is held) ------------------
-    def _start_hold_cut(self):
-        if self.engine.is_cutting or not self.armed:
-            return
-        threading.Thread(target=self._hold_cut_worker, daemon=True).start()
-
-    def _hold_cut_worker(self):
-        ok, msg = self.engine.cut(self.target_program)
-        if not ok:
-            self._ui(lambda: self.set_status(f"Cut failed: {msg}", DANGER))
-            return
-        play_sound(SOUND_ALERT)  # loud confirmation the cut fired
-        self._ui(lambda: self.set_status("CUT — holding…", DANGER))
-
-    def _end_hold_cut(self):
-        if not self.engine.is_cutting:
-            return
-        threading.Thread(target=self._hold_restore_worker, daemon=True).start()
-
-    def _hold_restore_worker(self):
-        # Do the reconnect FIRST, then update the UI -- the network restore must
-        # never be gated behind a (cross-thread) UI call.
-        ok, msg = self.engine.restore()
-        if not ok:
-            self._ui(lambda: self.set_status(f"Reconnect issue: {msg}", DANGER))
-        elif self.armed:
-            self._ui(
-                lambda: self.set_status(
-                    f"Armed — hold {self.bound_key_label}", ACCENT
-                )
-            )
-        else:
-            self._ui(lambda: self.set_status("Disarmed", TEXT_DIM))
+        def finish(g=gen, ok=ok, msg=msg):
+            if g != self._cut_gen:
+                return  # a newer cut owns the status line now
+            if not ok:
+                self.set_status(f"Reconnect issue: {msg}", DANGER)
+            elif self.armed:
+                self.set_status(f"Armed — {self._mode_verb()} {self.bound_key_label}", ACCENT)
+            else:
+                self.set_status("Disarmed", TEXT_DIM)
+        self._ui(finish)
 
     # -- Full-screen (Windows only; macOS has the native green button) ------
     def _toggle_fullscreen(self, _event=None):
@@ -1548,7 +1657,8 @@ class WebcamApp:
         w, h = win.winfo_reqwidth(), win.winfo_reqheight()
         margin = 24
         if corner == "top_left":
-            x, y = margin, margin
+            # Sit just below the persistent "Disconnected" box, which owns the corner.
+            x, y = margin, margin + 56
         elif corner == "top_center":
             x, y = (win.winfo_screenwidth() - w) // 2, margin
         else:  # top_right
@@ -1567,18 +1677,30 @@ class WebcamApp:
         new_timer = self.root.after(duration_ms, win.withdraw)
         setattr(self, timer_attr, new_timer)
 
-    # -- Top-center countdown overlay (timed cuts only) ----------------------
-    def _start_countdown(self, seconds):
-        """Show a live top-center timer counting `seconds` -> 0 in 0.01s steps.
-        Runs entirely on the Tk main thread."""
-        self._countdown_end = time.monotonic() + seconds
+    # -- Top-center countdown overlay (whenever the cut has a deadline) -------
+    def _start_countdown(self):
+        """Show a live top-center timer counting the current cut deadline
+        (self._reconnect_at) -> 0 in 0.01s steps. Idempotent and runs entirely
+        on the Tk main thread. Does nothing useful for an infinite hold."""
+        existing = getattr(self, "_countdown_after", None)
+        if existing is not None:
+            try:
+                self.root.after_cancel(existing)
+            except Exception:  # noqa: BLE001
+                pass
+            self._countdown_after = None
         self._countdown_on = True
         self._tick_countdown()
 
     def _tick_countdown(self):
         if not getattr(self, "_countdown_on", False):
             return
-        remaining = self._countdown_end - time.monotonic()
+        deadline = getattr(self, "_reconnect_at", None)
+        if deadline is None:
+            # No fixed deadline (infinite hold) -- nothing to count down.
+            self._stop_countdown()
+            return
+        remaining = deadline - time.monotonic()
         win = self._overlay("top_center")
         label = self._overlay_top_center_label
         if remaining <= 0:
@@ -1609,6 +1731,22 @@ class WebcamApp:
                 pass
             self._countdown_after = None
         win = getattr(self, "_overlay_top_center", None)
+        if win is not None and win.winfo_exists():
+            win.withdraw()
+
+    # -- Persistent "Disconnected" box (top-left, shown for the whole cut) ---
+    def _show_disconnected(self):
+        win = self._overlay("disc")
+        label = self._overlay_disc_label
+        label.config(text="Disconnected", fg=DANGER, font=self.header_font)
+        win.update_idletasks()
+        w, h = win.winfo_reqwidth(), win.winfo_reqheight()
+        win.geometry(f"{w}x{h}+24+24")
+        win.deiconify()
+        win.lift()
+
+    def _hide_disconnected(self):
+        win = getattr(self, "_overlay_disc", None)
         if win is not None and win.winfo_exists():
             win.withdraw()
 
