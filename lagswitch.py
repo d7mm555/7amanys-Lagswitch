@@ -144,7 +144,7 @@ def validate_token(token):
 # Bump CURRENT_VERSION and append one CHANGELOG entry every time a feature batch
 # ships -- this is what drives the one-time "What's New" screen after an update
 # and the manual Patch Notes view. Oldest entry first.
-CURRENT_VERSION = "1.7"
+CURRENT_VERSION = "1.7.1"
 CHANGELOG = [
     ("1.0", "First release", [
         "Bind a global trigger key and pick a disconnect duration (1-10s)",
@@ -193,6 +193,11 @@ CHANGELOG = [
         "New Hold slider: infinite, or cap the hold at 0.1-12s (auto-reconnect even if you're still holding)",
         "A 'Disconnected' box now shows top-left the whole time you're cut, in every mode",
         "The disconnect sound now fires the instant you press the key, with no delay",
+    ]),
+    ("1.7.1", "Bug fixes", [
+        "Fixed Back then Start breaking the settings screen (missing Arm button, sliders, etc.)",
+        "Fixed Both mode: pressing the key again to reconnect early could be mistaken for a new disconnect instead of a cancel",
+        "In Both mode, Hold can no longer trigger while a tap-started timed cut is still running -- it stays locked out until you're reconnected",
     ]),
 ]
 
@@ -1161,17 +1166,24 @@ class WebcamApp:
     def _apply_slider_state(self):
         """Grey out whichever slider the current mode doesn't use.
         DISCONNECT FOR drives Toggle (and a Both tap); HOLD FOR drives Hold
-        (and a Both hold); Both uses both sliders."""
+        (and a Both hold); Both uses both sliders.
+
+        Checks winfo_exists(), not just hasattr(): this runs once from each of
+        _build_duration_slider/_build_hold_slider, and on a second show_config()
+        the *other* row hasn't been rebuilt yet -- self.hold_slider (or
+        duration_slider) still points at the widget _clear() just destroyed.
+        Touching a destroyed Tk widget raises TclError, which used to abort the
+        rest of show_config() partway through (no Arm button, no Back link)."""
         timed = self.mode in ("toggle", "both")
         hold = self.mode in ("hold", "both")
-        if hasattr(self, "duration_slider"):
+        if getattr(self, "duration_slider", None) is not None and self.duration_slider.winfo_exists():
             if timed:
                 self.duration_slider.config(state="normal", fg=ACCENT, troughcolor=PANEL)
                 self.duration_value_badge.config(fg=BADGE_FG)
             else:
                 self.duration_slider.config(state="disabled", fg=TEXT_DIM, troughcolor=BG)
                 self.duration_value_badge.config(fg=TEXT_DIM)
-        if hasattr(self, "hold_slider"):
+        if getattr(self, "hold_slider", None) is not None and self.hold_slider.winfo_exists():
             if hold:
                 self.hold_slider.config(state="normal", fg=ACCENT, troughcolor=PANEL)
                 self.hold_value_badge.config(fg=BADGE_FG)
@@ -1397,8 +1409,9 @@ class WebcamApp:
             if self._other_key_recent(self.bound_key):
                 self.root.after(0, self._reject_multi_key)
             elif self.mode == "toggle":
-                # Timed: a press while already cutting cancels it early.
-                if self.engine.is_cutting:
+                # Timed: a press while already cutting (or still being cut --
+                # see _active_mode) cancels it early.
+                if self._active_mode is not None:
                     self.root.after(0, self.cancel_cut)
                 else:
                     play_sound(SOUND_ALERT)  # immediate: fired off the listener thread
@@ -1411,7 +1424,13 @@ class WebcamApp:
                     self.root.after(0, self._start_hold_cut)
             else:  # both
                 # A running timed cut (from a prior tap) is cancelled by a press.
-                if self.engine.is_cutting and self._active_mode == "timed":
+                # Checked via _active_mode, not engine.is_cutting: the latter only
+                # flips True once the (sometimes slow, especially on Windows)
+                # firewall call actually returns, so a fast "press again to
+                # reconnect" could land in that gap and be mistaken for a brand
+                # new disconnect attempt instead of a cancel. _active_mode is set
+                # synchronously the instant a cut is requested, so it has no gap.
+                if self._active_mode == "timed":
                     self.root.after(0, self.cancel_cut)
                 elif not self._key_down:
                     # Start as a hold now; the release decides tap-vs-hold.
@@ -1513,7 +1532,7 @@ class WebcamApp:
     # and self._cancel_event lets any release / second press / disarm end it now.
     def trigger_cut(self):
         """Start a timed cut (Toggle press)."""
-        if self.engine.is_cutting or not self.armed:
+        if self._active_mode is not None or not self.armed:
             return
         self._active_mode = "timed"
         self._reconnect_at = time.monotonic() + self.duration.get()
@@ -1524,7 +1543,7 @@ class WebcamApp:
     def _start_hold_cut(self):
         """Start a hold cut (Hold press, or the opening of a Both press).
         Capped by HOLD FOR; an infinite cap (0) holds until the key is released."""
-        if self.engine.is_cutting or not self.armed:
+        if self._active_mode is not None or not self.armed:
             return
         self._active_mode = "hold"
         limit = self.hold_limit.get()
@@ -1534,19 +1553,22 @@ class WebcamApp:
         threading.Thread(target=self._run_cut, args=(self._cut_gen,), daemon=True).start()
 
     def cancel_cut(self):
-        if self.engine.is_cutting:
+        # _active_mode (not engine.is_cutting) is the source of truth for "a cut
+        # is active or being started" -- see the "both" branch of _on_global_key
+        # for why engine.is_cutting lags behind actual intent.
+        if self._active_mode is not None:
             self._cancel_event.set()
 
     def _release_hold(self):
         """Hold mode: releasing the key reconnects (unless the cap already did)."""
-        if self.engine.is_cutting and self._active_mode == "hold":
+        if self._active_mode == "hold":
             self._cancel_event.set()
 
     def _release_both(self, pending):
         """Both mode: on release, decide whether the press was a tap or a hold."""
         if not pending:
             return
-        if not (self.engine.is_cutting and self._active_mode == "hold"):
+        if self._active_mode != "hold":
             return  # the cap already fired, or nothing is cutting
         held = time.monotonic() - self._both_press_time
         if held <= BOTH_TAP_MAX:
