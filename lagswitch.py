@@ -144,7 +144,7 @@ def validate_token(token):
 # Bump CURRENT_VERSION and append one CHANGELOG entry every time a feature batch
 # ships -- this is what drives the one-time "What's New" screen after an update
 # and the manual Patch Notes view. Oldest entry first.
-CURRENT_VERSION = "1.7.1"
+CURRENT_VERSION = "1.7.2"
 CHANGELOG = [
     ("1.0", "First release", [
         "Bind a global trigger key and pick a disconnect duration (1-10s)",
@@ -198,6 +198,10 @@ CHANGELOG = [
         "Fixed Back then Start breaking the settings screen (missing Arm button, sliders, etc.)",
         "Fixed Both mode: pressing the key again to reconnect early could be mistaken for a new disconnect instead of a cancel",
         "In Both mode, Hold can no longer trigger while a tap-started timed cut is still running -- it stays locked out until you're reconnected",
+    ]),
+    ("1.7.2", "Stronger multi-key guard", [
+        "The trigger now stays blocked for as long as any other key is held down, not just within 50ms of pressing it",
+        "Fixes a case where a key held for a while (e.g. a movement key or a non-repeating modifier) could still let the trigger fire",
     ]),
 ]
 
@@ -650,6 +654,16 @@ class WebcamApp:
         # event hands back a different object than the press, which used to leak a
         # never-emptying "held keys" set and stick the multi-key warning on forever.
         self._key_press_times = {}
+
+        # Keys currently physically held down (stable ids, see _key_id), so a
+        # hotkey can be blocked while *any* other key is still down -- no matter
+        # how long ago it was first pressed. _key_press_times/_other_key_recent
+        # alone can't express this: a key held for, say, several seconds without
+        # auto-repeating (common for modifier keys) would age out of that 50ms
+        # window while still physically held. This set is purely add-on-press,
+        # discard-on-release, matched by the same stable _key_id that fixed the
+        # old Windows press/release object-mismatch bug, so it can't stick.
+        self._keys_down = set()
 
         # Per-app cut target (Windows only). None = whole system. Not persisted
         # because the chosen window may be gone by the next launch.
@@ -1383,12 +1397,22 @@ class WebcamApp:
                 return True
         return False
 
+    def _other_key_down(self, hotkey):
+        """True if any key other than `hotkey` is *currently* physically held
+        down, no matter how long ago it was first pressed -- catches a key held
+        for seconds (e.g. a movement key, or a modifier that doesn't auto-repeat
+        and so wouldn't stay "recent")."""
+        hotkey_id = self._key_id(hotkey)
+        return bool(self._keys_down - {hotkey_id})
+
     # -- Global trigger -----------------------------------------------------
     def _on_global_key(self, key):
         # Record this key's press time first (under a stable id), regardless of
         # what else happens below -- this drives the 50ms "quiet window" guard.
         now = time.monotonic()
-        self._key_press_times[self._key_id(key)] = now
+        key_id = self._key_id(key)
+        self._key_press_times[key_id] = now
+        self._keys_down.add(key_id)
         # Prune stale timestamps so the dict can't grow without bound.
         if len(self._key_press_times) > 24:
             self._key_press_times = {
@@ -1403,10 +1427,11 @@ class WebcamApp:
             return
 
         if self.armed and self.bound_key is not None and self._keys_equal(key, self.bound_key):
-            # Trigger guard: reject if any *other* key was pressed in the last 50ms
-            # (covers both a held movement key, which auto-repeats, and a quick tap
-            # right before the trigger). Time-pruned, so it can never stick.
-            if self._other_key_recent(self.bound_key):
+            # Trigger guard: reject if any *other* key was pressed in the last
+            # 50ms (a quick tap right before the trigger) OR is still currently
+            # held down (no matter how long ago it started). Either way there's
+            # no way to disconnect while another key is involved.
+            if self._other_key_recent(self.bound_key) or self._other_key_down(self.bound_key):
                 self.root.after(0, self._reject_multi_key)
             elif self.mode == "toggle":
                 # Timed: a press while already cutting (or still being cut --
@@ -1441,7 +1466,7 @@ class WebcamApp:
                     self.root.after(0, self._start_hold_cut)
 
         if self.arm_key is not None and self._keys_equal(key, self.arm_key):
-            if self._other_key_recent(self.arm_key):
+            if self._other_key_recent(self.arm_key) or self._other_key_down(self.arm_key):
                 self.root.after(0, self._reject_multi_key)
             elif not self._arm_key_down:
                 self._arm_key_down = True
@@ -1451,6 +1476,7 @@ class WebcamApp:
         # Match by stable id so a release object that differs from the press
         # object still clears the debounce flag (else hold mode could stick on).
         rid = self._key_id(key)
+        self._keys_down.discard(rid)
 
         if self.bound_key is not None and rid == self._key_id(self.bound_key):
             was_down = self._key_down
