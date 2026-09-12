@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""Lagswitch launcher (Windows .exe entry point).
+"""Webcam launcher (Windows .exe entry point).
 
 This is the only part of the app that gets bundled into the frozen .exe and
 that ever needs a rebuild. Its job is small and stays that way: on every
 launch it fetches the latest lagswitch.py from the GitHub repo, compares it
 to the cached copy on disk, and runs whichever copy is current -- offering
 an in-app "Update" button instead of requiring a redownload of the .exe.
+
+(The payload file is still named lagswitch.py in the repo -- that's the fetch
+path the live-update relies on; only the user-facing app was renamed to Webcam.)
 
 Edit lagswitch.py and push to GitHub; users see "Update" next time they open
 the app and one click reloads the new code in-process.
@@ -32,7 +35,7 @@ FETCH_TIMEOUT = 4
 
 def _app_dir():
     base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
-    path = os.path.join(base, "Lagswitch")
+    path = os.path.join(base, "Webcam")
     os.makedirs(path, exist_ok=True)
     return path
 

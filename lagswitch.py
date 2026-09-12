@@ -144,7 +144,7 @@ def validate_token(token):
 # Bump CURRENT_VERSION and append one CHANGELOG entry every time a feature batch
 # ships -- this is what drives the one-time "What's New" screen after an update
 # and the manual Patch Notes view. Oldest entry first.
-CURRENT_VERSION = "1.7.2"
+CURRENT_VERSION = "1.7.3"
 CHANGELOG = [
     ("1.0", "First release", [
         "Bind a global trigger key and pick a disconnect duration (1-10s)",
@@ -203,6 +203,9 @@ CHANGELOG = [
         "The trigger now stays blocked for as long as any other key is held down, not just within 50ms of pressing it",
         "Fixes a case where a key held for a while (e.g. a movement key or a non-repeating modifier) could still let the trigger fire",
     ]),
+    ("1.7.3", "Custom app icon", [
+        "The .exe now ships with a custom icon instead of the generic default",
+    ]),
 ]
 
 
@@ -220,6 +223,26 @@ def app_dir():
     except OSError:
         pass
     return path
+
+
+def bundled_icon_path():
+    """Path to icon.ico inside the frozen .exe (Windows only), or None.
+
+    Resolved via sys._MEIPASS -- PyInstaller's per-run extraction folder for
+    the launcher.exe that's hosting this (live-updated) payload -- rather than
+    threaded through launcher.py's call signature, so an old cached copy of
+    this file and a newly rebuilt launcher.exe can never mismatch on a
+    function signature. Missing/not frozen just means no custom icon, not an
+    error: dev runs of the raw script, and older exes built before this
+    feature shipped, don't have icon.ico bundled at all.
+    """
+    if not IS_WIN:
+        return None
+    base = getattr(sys, "_MEIPASS", None)
+    if not base:
+        return None
+    path = os.path.join(base, "icon.ico")
+    return path if os.path.isfile(path) else None
 
 
 SETTINGS_PATH = os.path.join(app_dir(), "settings.json")
@@ -679,6 +702,13 @@ class WebcamApp:
         root.minsize(540, 520)
         root.resizable(True, True)
         root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+        icon_path = bundled_icon_path()
+        if icon_path:
+            try:
+                root.iconbitmap(icon_path)
+            except tk.TclError:
+                pass
 
         # F11 toggles full-screen on Windows (macOS users have the native
         # green-button full-screen instead); Esc exits it.
